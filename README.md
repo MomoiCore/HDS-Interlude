@@ -3,6 +3,7 @@
 > 聊天在幕前发生，生活在幕间继续。
 
 HDS（Hyperrealistic Dialogue System）Interlude 旨在创造面向一对一线上聊天关系的、高度独立的超拟真对话对象，并为 AI 拟真对话提供一种新的思路框架。
+
 它基于koishi开发，作为koishi插件存在。
 
 幕间系统在尝试为拟真对话提供一条不同于传统对话 Bot 的路径：
