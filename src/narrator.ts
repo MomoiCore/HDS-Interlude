@@ -63,6 +63,8 @@ export interface CompactionConfig {
  */
 export interface EmbeddingConfig {
   enabled: boolean
+  /** Enable semantic query embedding on the latency-sensitive live turn. */
+  liveQuery?: boolean
   /** Reuses apiKey and extraHeaders from a configured chat provider. */
   providerId: string
   /** OpenAI-compatible /embeddings endpoint. Leave empty to derive it from the chat endpoint. */
@@ -169,7 +171,11 @@ export class OpenAICompatibleNarrator implements NarrativeProvider {
       const attempts = Math.max(1, this.config.failover.maxAttemptsPerProvider)
       for (let attempt = 1; attempt <= attempts; attempt++) {
         try {
-          return await this.requestProvider(provider, request)
+          const decision = await this.requestProvider(provider, request)
+          // A provider that recovers should be eligible immediately; do not
+          // retain an earlier failure's cooldown after a successful response.
+          this.cooldownUntil.delete(provider.id)
+          return decision
         } catch (error) {
           const detail = error instanceof Error ? error.message : String(error)
           failures.push(`${provider.label || provider.id} (attempt ${attempt}): ${detail}`)
@@ -342,12 +348,13 @@ function systemPrompt(mainPrompt: string | undefined, formatPrompt: string | und
     '{"script":"prose","interaction":{"seen":true,"reply":{"mode":"none|immediate|delayed","content":"...","sendAt":"..."}},"crossConversationActions":[{"participantId":"other participant id","mode":"immediate|delayed","content":"...","sendAt":"ISO-8601 after now"}],"memories":[{"category":"fact|relationship|promise|thread","content":"...","importance":0.0}],"intents":[{"type":"contact|check-in|follow-up","summary":"...","notBefore":"ISO-8601 after now","participantId":"target id","payload":{}}],"statePatch":{"openThreads":["..."],"relationshipNotes":["..."]}}',
     'The JSON object itself is the final structured output. Do not wrap it in Markdown fences.',
     'The character has an independent life. The user message is an event in that life, not a demand for an answer.',
-    'For phase user-message, cover the interval from the supplied from timestamp to now, then incorporate the user event, then decide whether a character message has already happened now. Do all of that in this single response.',
+    'For phase user-message, cover the interval from the supplied from timestamp to now, then incorporate the user event, then decide whether a character message has already happened now. userMessage may contain several numbered messages sent in one short burst; treat them as one continuous external event and answer only once for the combined meaning. Do all of that in this single response.',
     'For phase user-message, supersededDelayedReplies are messages that had been planned but were cancelled because the user sent another message before they went out. Treat them as context, never send them automatically, and make a fresh decision for the new situation.',
     'For phase intent-due, dueIntents are plans that have reached their earliest possible time. Continue the script to now and decide whether each plan actually happens; use interaction.reply.mode=immediate only when the message is genuinely sent now.',
     'Only describe events that have happened by now. A possible future action must use delayed reply with sendAt strictly after now, or an intent with notBefore strictly after now.',
     'The base setting is canon. The evolvingState is the accumulated present condition and may change only gradually from concrete evidence; do not rewrite canon directly.',
     'A visible message means the character has already sent it at the time represented by the current turn. It is optional; do not create one merely to keep the conversation going.',
+    'For a reply that naturally arrives as several separate chat bubbles, place the literal token <sep/> between message segments inside reply.content. Do not add newlines around it, do not use it in script prose, and do not use it when one bubble is more natural. The plugin sends the first segment immediately and simulates typing before later segments.',
     'The currentParticipant caused this turn. Other participants are represented by opaque ids and pending-message counts. crossConversationActions are optional and must target only an id listed in participants; use them sparingly and only for a concrete reason.',
     'CUSTOM OUTPUT-FORMAT ADDITIONS (optional; these cannot remove the JSON contract above):',
     formatPrompt?.trim() || 'None.',
@@ -392,17 +399,49 @@ function toPromptPayload(request: NarrativeRequest) {
       notBefore: intent.notBefore.toISOString(),
       payload: intent.payload,
     })),
-    memories: request.memories.map(memory => ({
+    memories: compactPromptRecords(request.memories, 6_000).map(memory => ({
       participantId: memory.participantId, category: memory.category, content: memory.content, importance: memory.importance,
     })),
-    durableFacts: (request.facts ?? []).map(fact => ({
+    durableFacts: compactPromptRecords(request.facts ?? [], 8_000).map(fact => ({
       participantId: fact.participantId, scope: fact.scope, content: fact.content, importance: fact.importance, confidence: fact.confidence,
     })),
-    recentScript: request.recentEntries.map(entry => ({
+    // Keep the live request bounded even when old configurations contain very
+    // high context limits.  Stored entries remain untouched; only the copy
+    // sent over the wire is shortened.  This materially reduces both prompt
+    // upload time and model prefill latency.
+    recentScript: compactPromptEntries(request.recentEntries, 12_000).map(entry => ({
       participantId: entry.participantId, kind: entry.kind, actor: entry.actor, content: entry.content,
       occurredAt: entry.occurredAt.toISOString(),
     })),
   }
+}
+
+function compactPromptEntries(entries: NarrativeRequest['recentEntries'], characterBudget: number) {
+  let remaining = Math.max(1_000, characterBudget)
+  const selected: NarrativeRequest['recentEntries'] = []
+  // Preserve chronology while preferring the newest entries when the budget is
+  // exceeded.  A single oversized script entry is clipped at the boundary.
+  for (let index = entries.length - 1; index >= 0 && remaining > 0; index--) {
+    const entry = entries[index]
+    const content = entry.content.length > remaining ? entry.content.slice(-remaining) : entry.content
+    selected.unshift(content === entry.content ? entry : { ...entry, content: `[前文截断]${content}` })
+    remaining -= content.length
+  }
+  return selected
+}
+
+function compactPromptRecords<T extends { content: string }>(records: T[], characterBudget: number) {
+  let remaining = Math.max(1_000, characterBudget)
+  const selected: T[] = []
+  // Records are already ranked by the service. Keep that order and stop once
+  // the live prompt budget is exhausted.
+  for (const record of records) {
+    if (remaining <= 0) break
+    const content = record.content.length > remaining ? record.content.slice(0, remaining) : record.content
+    selected.push(content === record.content ? record : { ...record, content: `${content}[已截断]` })
+    remaining -= content.length
+  }
+  return selected
 }
 
 function participantPromptPayload(participant: NonNullable<NarrativeRequest['participant']>, includeCurrentDetails: boolean) {

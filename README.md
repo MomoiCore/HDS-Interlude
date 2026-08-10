@@ -2,13 +2,19 @@
 
 > 聊天在幕前发生，生活在幕间继续。
 
-> **Beta 0.1.0-beta**：首次公开测试版，用于验证功能、兼容性与长期运行稳定性。请在测试环境中使用，并妥善保管 API Key 与私聊数据。
+> 当前版本：0.1.0。请先在测试环境中验证服务商、权限和数据清理流程，并妥善保管 API Key 与私聊数据。
 
 HDS Interlude 是一个基于 Koishi 的多人共享主剧本拟真聊天框架。它不把角色理解为“收到消息后立即生成回答的 Bot”，而把每个角色理解为一部持续推进的生活剧本的主角；多个 QQ 账号可以成为这部剧本里的不同关系对象。
 
 用户发来的消息不是命令，也不是必须立刻回答的问题；它是发生在角色现实中的外部事件。角色会看见、忽略、犹豫、延迟、回复，也会在自己的日程和关系变化里主动联系。可见聊天消息只是剧本中已经发生的一个动作。
 
-本仓库提供的是框架、数据协议和运行机制，不附带特定角色或特定模型服务商。
+本仓库提供框架、数据协议和运行机制，不附带特定角色或特定模型服务商。详细配置和管理员命令分别见 `CONFIGURATION_GUIDE.md` 与 `command.md`。
+
+## 最新对话节奏
+
+- 每条私聊消息先保存，再等待 2 秒；期间同一用户的连续消息会合并成一次主模型写作。
+- 主模型启动后的 5 秒内若收到同一用户的新消息，旧结果标记为过期，不会落库或发出；新消息会重新进行完整写作。
+- 两个参数可在 Console 的运行配置中修改：`userMessageDebounceSeconds`、`staleNarrativeRequestWindowSeconds`。
 
 ## 1. 设计原则
 
@@ -152,7 +158,7 @@ script 是剧本，interaction 是机器可执行的幕前结果。两者分离�
 
 同一主剧本的所有账号共用一条写作队列。账号 A 的消息正在触发模型推理时，账号 B 的消息会排在同一个队列中，而不会启动第二个互相矛盾的角色副本。
 
-从旧版升级时，插件会在账号首次返回时把旧的“每账号故事”迁移为对应机器人的共享主剧本参与者；如果同一机器人下还有其它旧账号故事，它们会在各自首次返回时合并并标记为 archived，避免后台继续把旧副本当成另一种生活推进。
+从旧版升级时，插件会在账号首次返回时把旧的“每账号故事”迁移为共享主剧本参与者。当前版本强制执行“每个消息平台仅一部活动主剧本”：启动后台任务、收到私聊或执行清理指令时，插件都会保留一部规范主剧本，并将同平台其它 `active` 剧本归档为 `archived`，避免旧沙箱数据被后台继续推进。
 
 ## 5. 延迟回复为什么能像真实聊天一样被打断
 
@@ -503,7 +509,7 @@ onebot:
 
 | 字段 | 含义 |
 | --- | --- |
-| `enabled` | 打开后故事按机器人账号归档，多个获授权 QQ 进入同一主剧本；关闭可临时退回旧的每账号故事模式。 |
+| `enabled` | 历史兼容字段。运行时固定启用共享单主剧本，并强制每个消息平台只保留一部活动剧本；请不要依赖关闭它来创建每账号故事。 |
 | `autoEnrollParticipants` | 新 QQ 第一次私聊时自动成为主剧本参与者。 |
 | `allowCrossConversationMessages` | 允许模型在当前回合顺带给其他参与者发消息。关闭后仍共享生活，但不会跨账号主动联系。 |
 | `shareParticipantDetails` | 是否把其他账号的历史剧本交给模型。涉及隐私，默认关闭；即使打开，其他参与者的资料与关系字段仍不直接发送，模型只会通过剧本内容了解已经发生的事情。 |
@@ -628,7 +634,7 @@ sharedStory:
 | `majorStatePatchConfidenceThreshold` / `allowMajorStateChanges` | 重大变化的更严格门槛和自动应用开关。保守测试可关闭自动重大变化。 |
 | `autoApplyStatePatches` | 是否自动应用满足门槛的慢变化；想人工审核每次变化时关闭。 |
 
-`logging` 只影响排查信息，不影响角色：默认 `level=info`、`format=detailed` 会用中文分行显示收到私聊、模型决策完成、消息投递、自动推进和压缩完成；出现 API 或模型问题时可临时切到 `debug`。`logScriptPreview` 可能把私聊内容写进日志，排查后应关闭。
+`logging` 只影响排查信息，不影响角色：默认 `level=info`、`format=detailed` 会用中文分行显示收到私聊、模型决策完成、消息投递、自动推进和压缩完成；出现 API 或模型问题时可临时切到 `debug`。`logScriptPreview` 控制是否输出当前剧本内容，`logMessageContent` 控制是否输出用户消息和主角可见消息内容；两项都可能暴露私聊内容，排查后应关闭。
 
 推荐实践：
 
@@ -650,6 +656,21 @@ sharedStory:
 | interlude.memory [limit] | 查看主回合产出的耐久记忆 |
 | interlude.context | 查看活动场景、剧情弧线、演化覆写和已检索事实 |
 | interlude.compact | 立即请求一次记忆压缩 |
+| interlude.script [limit] | 管理员查看共享主剧本原始条目 |
+| interlude.script.note <content> | 管理员写入可审计的人工剧本注记 |
+| interlude.memory.facts [limit] | 管理员查看长期事实和编号 |
+| interlude.memory.add <scope> <content> | 管理员添加高置信度长期事实 |
+| interlude.memory.forget <id> | 管理员将长期事实标记为失效 |
+| interlude.memory.intents [limit] / cancel <id> | 管理员查看或取消等待中的意图 |
+| interlude.memory.patches [limit] / reject <id> | 管理员查看或拒绝设定演化提案 |
+| interlude.database.clear <confirmation> | 管理员清空 HDSI 自有 SQLite 表，不影响 Koishi 或其它插件 |
+| interlude.purge.all <confirmation> | 管理员彻底重置所有平台的剧本、派生记忆和 Canon，需要确认口令 |
+| interlude.purge.platform <platform> <confirmation> | 管理员清空并归档指定平台的全部故事，例如 sandbox 或 onebot |
+| interlude.purge.range <from> <to> <confirmation> | 管理员删除指定时间段的剧本和关联记忆 |
+
+删除指令会先尝试物理删除；如果 SQLite 文件被占用，插件会自动降级为逻辑删除并清空正文，避免删除操作因 `disk I/O error` 中断。
+
+管理员完整操作说明见 [`command.md`](command.md)。
 
 ## 11. 代码结构和扩展点
 

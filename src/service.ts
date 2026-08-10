@@ -86,6 +86,20 @@ export interface RuntimeConfig {
   minimumDelayedReplySeconds: number
   maximumDelayedReplyMinutes: number
   cancelDelayedRepliesOnUserMessage: boolean
+  /** Retry a user turn after a transient narrative-provider failure. */
+  narrativeRetryDelaySeconds?: number
+  /** Maximum automatic retries per failed user turn; 0 disables retry. */
+  narrativeRetryMaxAttempts?: number
+  /** Split model reply.content into multiple QQ messages at the configured separator. */
+  splitReplyMessages?: boolean
+  messageSeparator?: string
+  typingBaseDelaySeconds?: number
+  typingCharactersPerSecond?: number
+  typingMaxDelaySeconds?: number
+  /** Wait after the newest user message before starting a writing request. */
+  userMessageDebounceSeconds?: number
+  /** A new message inside this early request window supersedes that request. */
+  staleNarrativeRequestWindowSeconds?: number
   /** 新版自动推进调度；旧版 minimumAdvanceMinutes 仍保留兼容。 */
   autoAdvanceEnabled?: boolean
   autoAdvanceIntervalMinutes?: number
@@ -141,6 +155,27 @@ interface AutoAdvanceConfig {
   restWindows: RestWindow[]
 }
 
+interface BufferedUserMessage {
+  content: string
+  occurredAt: Date
+  supersededIntents: NarrativeIntent[]
+}
+
+/** A per-relationship input buffer. Messages are durable immediately, while
+ * the narrator waits briefly for the user to finish a short burst. */
+interface BufferedNarrativeTurn {
+  storyId: string
+  participantId: string
+  messages: BufferedUserMessage[]
+  latestSession?: Session
+  /** Context timers return a disposer rather than Node's native Timeout. */
+  timer?: () => void
+  nextRevision: number
+  inFlightRequestId?: number
+  inFlightStartedAt?: number
+  obsoleteRequestIds: Set<number>
+}
+
 export interface StoryDefaults {
   characterName: string
   characterProfile: string
@@ -157,6 +192,8 @@ export interface LoggingConfig {
   level: 'silent' | 'error' | 'warn' | 'info' | 'debug'
   format: 'compact' | 'detailed'
   logScriptPreview: boolean
+  /** Emit user-visible incoming/outgoing message bodies to the plugin log. */
+  logMessageContent?: boolean
   previewLength: number
 }
 
@@ -170,10 +207,16 @@ export class InterludeService extends Service {
    * 取消旧延迟回复”可能与定时发送同时发生，造成过期消息仍被发出。
    */
   private queues = new Map<string, Promise<unknown>>()
+  private bufferedNarrativeTurns = new Map<string, BufferedNarrativeTurn>()
+  /** Prevent a background life turn from racing an unlocked live model call. */
+  private narratingStories = new Set<string>()
   private factBackfills = new Set<string>()
+  /** sql.js/SQLite has one writable connection; serialize writes globally. */
+  private databaseWriteQueue: Promise<unknown> = Promise.resolve()
   /** Use Koishi's context-bound logger so Console/runtime targets receive records. */
   private readonly serviceLogger: Logger
   private backgroundStarted = false
+  private databaseResetting = false
 
   constructor(ctx: Context, public config: Config) {
     super(ctx, 'interlude')
@@ -260,14 +303,20 @@ export class InterludeService extends Service {
   }
 
   async findStory(session: Session) {
-    const id = this.sharedStoryConfig.enabled
-      ? storyIdForCharacter(session.platform, session.selfId)
-      : legacyStoryIdFor(session.platform, session.selfId, session.userId)
-    const existing = (await this.ctx.database.get('interlude_story', { id }))[0]
-    if (existing || !this.sharedStoryConfig.enabled) {
-      if (existing && this.sharedStoryConfig.enabled) await this.migrateLegacyBranchIntoShared(existing, session)
-      return existing
+    if (this.sharedStoryConfig.enabled) {
+      // Shared mode deliberately has one canonical active story in the whole
+      // Koishi instance. Sandbox and OneBot must not run parallel lives.
+      const existing = await this.getCanonicalStory(storyIdForCharacter(session.platform, session.selfId))
+      if (existing) {
+        const sharedId = storyIdForCharacter(session.platform, session.selfId)
+        if (existing.platform === session.platform && existing.id !== sharedId) return this.migrateLegacyStory(existing, session)
+        await this.migrateLegacyBranchIntoShared(existing, session)
+        return existing
+      }
     }
+    const id = legacyStoryIdFor(session.platform, session.selfId, session.userId)
+    const existing = (await this.ctx.database.get('interlude_story', { id }))[0]
+    if (existing || !this.sharedStoryConfig.enabled) return existing
 
     // Old beta versions used one story id per QQ. Migrate lazily when that QQ
     // first returns, so existing scripts become the first relationship branch
@@ -275,6 +324,28 @@ export class InterludeService extends Service {
     const legacyId = legacyStoryIdFor(session.platform, session.selfId, session.userId)
     const legacy = (await this.ctx.database.get('interlude_story', { id: legacyId }))[0]
     return legacy ? this.migrateLegacyStory(legacy, session) : undefined
+  }
+
+  /**
+   * Resolve and enforce the one global active story. The preferred id wins
+   * when present; otherwise the most recently updated row is retained and
+   * every other active row is archived immediately.
+   */
+  private async getCanonicalStory(preferredId?: string) {
+    const active = await this.ctx.database.get('interlude_story', { status: 'active' }, {
+      sort: { updatedAt: 'desc' },
+    })
+    if (!active.length) return undefined
+    const canonical = (preferredId && active.find(story => story.id === preferredId))
+      ?? active.find(story => story.id.startsWith('character:'))
+      ?? active[0]
+    const now = new Date()
+    for (const story of active) {
+      if (story.id === canonical.id) continue
+      await this.dbSet('interlude_story', { id: story.id }, { status: 'archived', updatedAt: now })
+      this.reportStandalone('warn', '检测到多个活动主剧本，保留故事=%s，已归档旧故事=%s（范围=%s）', canonical.id, story.id, '全局')
+    }
+    return canonical
   }
 
   async findParticipant(session: Session, story?: InterludeStory) {
@@ -304,20 +375,7 @@ export class InterludeService extends Service {
       return existing
     }
     const now = new Date()
-    const setting = emptyStorySetting()
-    const defaults = this.config.storyDefaults
-    setting.character.name = name?.trim() || defaults.characterName || setting.character.name
-    setting.character.profile = defaults.characterProfile
-    // The legacy user field remains as a backwards-compatible default. The
-    // real per-person profile and relationship now live on participants.
-    setting.user.displayName = 'Multiple participants'
-    setting.user.profile = defaults.userProfile
-    setting.relationship = defaults.relationship
-    setting.world = defaults.world
-    setting.supportingCast = defaults.supportingCast
-    setting.location = defaults.location
-    setting.style = defaults.style || setting.style
-    setting.timezone = defaults.timezone || setting.timezone
+    const setting = this.initialStorySetting(name)
     const story: InterludeStory = {
       id: this.sharedStoryConfig.enabled
         ? storyIdForCharacter(session.platform, session.selfId)
@@ -327,7 +385,7 @@ export class InterludeService extends Service {
       cursorAt: now, createdAt: now, updatedAt: now,
     }
     try {
-      await this.ctx.database.create('interlude_story', story)
+      await this.dbCreate('interlude_story', story)
     } catch (error) {
       // Two accounts can DM a newly started bot at almost the same time. The
       // database primary key is the final arbiter; join the winner instead of
@@ -361,7 +419,7 @@ export class InterludeService extends Service {
       const displayName = account?.label?.trim() || preset?.label?.trim() || existing.displayName || session.username || session.userId
       const profile = account?.profile?.trim() || preset?.profile?.trim() || existing.profile || this.config.storyDefaults.userProfile
       const relationship = account?.relationship?.trim() || preset?.relationship?.trim() || existing.relationship || this.config.storyDefaults.relationship
-      await this.ctx.database.set('interlude_participant', { id: existing.id }, {
+      await this.dbSet('interlude_participant', { id: existing.id }, {
         storyId: story.id, channelId: session.channelId, personId, displayName, profile, relationship, updatedAt: now,
       })
       return { ...existing, storyId: story.id, channelId: session.channelId, personId, displayName, profile, relationship, updatedAt: now }
@@ -384,7 +442,7 @@ export class InterludeService extends Service {
       state: emptyParticipantState(), status: 'active', createdAt: now, updatedAt: now,
     }
     try {
-      await this.ctx.database.create('interlude_participant', participant)
+    await this.dbCreate('interlude_participant', participant)
     } catch (error) {
       // Two first private messages can arrive before either request enters the
       // story queue.  The primary key resolves that race; return the branch
@@ -404,13 +462,13 @@ export class InterludeService extends Service {
   async updateSetting(story: InterludeStory, patch: Partial<StorySetting>) {
     const setting = mergeSetting(story.setting, patch)
     const now = new Date()
-    await this.ctx.database.set('interlude_story', { id: story.id }, { setting, updatedAt: now })
+    await this.dbSet('interlude_story', { id: story.id }, { setting, updatedAt: now })
     return { ...story, setting, updatedAt: now }
   }
 
   async setStatus(story: InterludeStory, status: InterludeStory['status']) {
     const now = new Date()
-    await this.ctx.database.set('interlude_story', { id: story.id }, { status, updatedAt: now })
+    await this.dbSet('interlude_story', { id: story.id }, { status, updatedAt: now })
     return { ...story, status, updatedAt: now }
   }
 
@@ -435,7 +493,232 @@ export class InterludeService extends Service {
       .slice(0, limit)
   }
 
+  /** Administrative view: includes global and participant-specific durable facts. */
+  async adminFacts(storyId: string, limit = 20) {
+    return this.ctx.database.get('interlude_fact', { storyId, status: 'active' }, {
+      limit: Math.max(1, Math.min(limit, 100)),
+      sort: { updatedAt: 'desc' },
+    })
+  }
+
+  async adminPendingIntents(storyId: string, limit = 20) {
+    return this.ctx.database.get('interlude_intent', { storyId, status: 'pending' }, {
+      limit: Math.max(1, Math.min(limit, 100)),
+      sort: { notBefore: 'asc' },
+    })
+  }
+
+  async adminStatePatches(storyId: string, limit = 20) {
+    return this.ctx.database.get('interlude_state_patch', { storyId }, {
+      limit: Math.max(1, Math.min(limit, 100)),
+      sort: { createdAt: 'desc' },
+    })
+  }
+
+  /** Adds an audit-visible system note without pretending it came from the model. */
+  async addAdminScriptNote(story: InterludeStory, content: string) {
+    const text = clip(content, this.config.runtime.maxScriptCharacters)
+    if (!text) return false
+    const now = new Date()
+    await this.appendEntry(story.id, {
+      kind: 'admin-note', actor: 'system', content: `[管理员注记] ${text}`,
+      occurredAt: now.toISOString(), metadata: { source: 'administrator' },
+    }, now)
+    this.scheduleCompaction(story.id)
+    return true
+  }
+
+  /** Adds a high-confidence fact for corrections that must survive compaction. */
+  async addAdminFact(story: InterludeStory, scope: NarrativeFact['scope'], content: string) {
+    const text = clip(content, this.memoryConfig.factContentCharacters)
+    if (!text) return false
+    const now = new Date()
+    await this.dbCreate('interlude_fact', {
+      storyId: story.id, participantId: '', scope, content: text,
+      importance: 0.8, confidence: 1, unresolved: false, embedding: await this.embedText(text),
+      status: 'active', sourceEntryIds: [], lastSeenAt: now, createdAt: now, updatedAt: now,
+    })
+    return true
+  }
+
+  /** Reversible deletion: facts are retained as superseded rows for audit. */
+  async forgetAdminFact(storyId: string, id: number) {
+    const fact = (await this.ctx.database.get('interlude_fact', { id, storyId, status: 'active' }))[0]
+    if (!fact) return false
+    await this.dbSet('interlude_fact', { id }, { status: 'superseded', updatedAt: new Date() })
+    return true
+  }
+
+  async cancelAdminIntent(storyId: string, id: number) {
+    const intent = (await this.ctx.database.get('interlude_intent', { id, storyId, status: 'pending' }))[0]
+    if (!intent) return false
+    await this.dbSet('interlude_intent', { id }, { status: 'cancelled', updatedAt: new Date() })
+    return true
+  }
+
+  async rejectAdminStatePatch(storyId: string, id: number) {
+    const patch = (await this.ctx.database.get('interlude_state_patch', { id, storyId, status: 'proposed' }))[0]
+    if (!patch) return false
+    await this.dbSet('interlude_state_patch', { id }, { status: 'rejected' })
+    return true
+  }
+
+  /**
+   * Destructive administrative operation. The caller must validate the
+   * confirmation phrase. A full purge also rebuilds Canon from the current
+   * Console configuration, so an old profile cannot survive in later prompts.
+   */
+  async purgeAllStoryData(storyId: string) {
+    this.invalidateBufferedNarratives(storyId)
+    await this.purgeTable('interlude_script_entry', { storyId }, {
+      kind: 'redacted', actor: 'system', content: '[管理员已删除剧本内容]', metadata: { redacted: true },
+    })
+    await this.purgeTable('interlude_memory', { storyId }, { status: 'deleted', content: '[管理员已删除记忆]' })
+    await this.purgeTable('interlude_intent', { storyId }, { status: 'cancelled', summary: '[管理员已取消意图]' })
+    await this.purgeTable('interlude_scene', { storyId }, { status: 'closed', hook: '', summary: '', entryCount: 0 })
+    await this.purgeTable('interlude_arc', { storyId }, { status: 'closed', summary: '', sceneCount: 0 })
+    await this.purgeTable('interlude_fact', { storyId }, { status: 'superseded', content: '[管理员已删除事实]' })
+    await this.purgeTable('interlude_state_patch', { storyId }, { status: 'rejected', proposedValue: '[管理员已删除提案]', evidence: '' })
+    const now = new Date()
+    const story = await this.getStory(storyId)
+    const setting = this.initialStorySetting()
+    await this.dbSet('interlude_story', { id: storyId }, {
+      setting, state: emptyStoryState(), cursorAt: now, updatedAt: now,
+    })
+    await this.resetParticipantCanon(storyId, now)
+    await this.ensureContinuity({ ...story, setting, state: emptyStoryState(), cursorAt: now }, now)
+  }
+
+  /** Reset all platforms, retaining exactly one empty global canonical story. */
+  async purgeAllData(preferredStoryId?: string) {
+    const all = await this.ctx.database.get('interlude_story', {}, { sort: { updatedAt: 'desc' } })
+    const active = all.filter(story => story.status === 'active')
+    if (!active.length) return undefined
+    const canonical = (preferredStoryId && active.find(story => story.id === preferredStoryId)) ?? active[0]
+    for (const story of all) await this.purgeAllStoryData(story.id)
+    const now = new Date()
+    for (const story of all) {
+      if (story.id === canonical.id) continue
+      await this.dbSet('interlude_story', { id: story.id }, { status: 'archived', updatedAt: now })
+    }
+    return canonical.id
+  }
+
+  /** Delete one adapter/platform's records without touching other platforms. */
+  async purgePlatformData(platform: string) {
+    const all = await this.ctx.database.get('interlude_story', {}, { sort: { updatedAt: 'desc' } })
+    const targets = all.filter(story => samePlatformFamily(story.platform, platform))
+    for (const story of targets) {
+      await this.purgeAllStoryData(story.id)
+      await this.dbSet('interlude_story', { id: story.id }, { status: 'archived', updatedAt: new Date() })
+    }
+    return targets.length
+  }
+
+  /**
+   * Clear only HDSI-owned tables. Koishi's users/channels and other plugins
+   * are intentionally untouched; deleting the physical SQLite file from a
+   * command would be unsafe while the driver is open.
+   */
+  async clearDatabase() {
+    if (this.databaseResetting) throw new Error('HDSI 数据库清空已经在进行中。')
+    this.databaseResetting = true
+    this.invalidateBufferedNarratives()
+    try {
+    const tables = [
+      'interlude_script_entry', 'interlude_memory', 'interlude_intent',
+      'interlude_scene', 'interlude_arc', 'interlude_fact', 'interlude_state_patch',
+      'interlude_participant', 'interlude_story',
+    ] as const
+    let removed = 0
+    let logicallyCleared = 0
+    for (const table of tables) {
+      const rows = await this.ctx.database.get(table, {})
+      if (!rows.length) continue
+      removed += rows.length
+      try {
+        await this.dbRemove(table, {})
+      } catch (error) {
+        // Preserve the established disk-I/O fallback: content is redacted and
+        // stories are archived so a locked sql.js file cannot revive a story.
+        this.serviceLogger.warn('SQLite 清空表失败，改用逻辑清空：表=%s 错误=%s', table, error)
+        for (const row of rows) {
+          const id = (row as any).id
+          const fallback: any = table === 'interlude_story'
+            ? { status: 'archived', setting: this.initialStorySetting(), state: emptyStoryState() }
+            : table === 'interlude_participant'
+              ? { status: 'paused', profile: '', relationship: '', state: emptyParticipantState() }
+              : table === 'interlude_script_entry'
+                ? { kind: 'redacted', actor: 'system', content: '[HDSI 数据库已清空]', metadata: { redacted: true } }
+                : table === 'interlude_memory'
+                  ? { status: 'deleted', content: '[HDSI 数据库已清空]' }
+                  : table === 'interlude_intent'
+                    ? { status: 'cancelled', summary: '[HDSI 数据库已清空]' }
+                    : table === 'interlude_scene' || table === 'interlude_arc'
+                      ? { status: 'closed', hook: '', summary: '', entryCount: 0, sceneCount: 0 }
+                      : table === 'interlude_fact'
+                        ? { status: 'superseded', content: '[HDSI 数据库已清空]' }
+                        : { status: 'rejected', proposedValue: '[HDSI 数据库已清空]', evidence: '' }
+          await this.dbSet(table, { id }, fallback)
+          logicallyCleared++
+        }
+      }
+    }
+    return { removed, logicallyCleared }
+    } finally {
+      this.databaseResetting = false
+    }
+  }
+
+  /** Remove script and derived memory records whose timestamps overlap a range. */
+  async purgeStoryRange(storyId: string, from: Date, to: Date) {
+    this.invalidateBufferedNarratives(storyId)
+    const inRange = (value: Date | null | undefined) => !!value && value >= from && value <= to
+    const entries = await this.ctx.database.get('interlude_script_entry', { storyId })
+    const entryIds = new Set(entries.filter(entry => inRange(entry.occurredAt)).map(entry => entry.id))
+    for (const entry of entries) if (entryIds.has(entry.id)) await this.purgeTable('interlude_script_entry', { id: entry.id }, {
+      kind: 'redacted', actor: 'system', content: '[管理员已删除剧本内容]', metadata: { redacted: true },
+    })
+
+    const memories = await this.ctx.database.get('interlude_memory', { storyId })
+    for (const memory of memories) {
+      if (inRange(memory.createdAt) || (memory.sourceEntryId != null && entryIds.has(memory.sourceEntryId))) {
+        await this.purgeTable('interlude_memory', { id: memory.id }, { status: 'deleted', content: '[管理员已删除记忆]' })
+      }
+    }
+
+    const facts = await this.ctx.database.get('interlude_fact', { storyId })
+    for (const fact of facts) {
+      const sourced = (fact.sourceEntryIds ?? []).some(id => entryIds.has(id))
+      if (inRange(fact.createdAt) || inRange(fact.updatedAt) || inRange(fact.lastSeenAt) || sourced) {
+        await this.purgeTable('interlude_fact', { id: fact.id }, { status: 'superseded', content: '[管理员已删除事实]' })
+      }
+    }
+
+    const intents = await this.ctx.database.get('interlude_intent', { storyId })
+    for (const intent of intents) {
+      if (inRange(intent.createdAt) || inRange(intent.notBefore) || inRange(intent.updatedAt)) {
+        await this.purgeTable('interlude_intent', { id: intent.id }, { status: 'cancelled', summary: '[管理员已取消意图]' })
+      }
+    }
+
+    const scenes = await this.ctx.database.get('interlude_scene', { storyId })
+    for (const scene of scenes) {
+      const overlaps = scene.startedAt <= to && (!scene.endedAt || scene.endedAt >= from)
+      if (overlaps) await this.purgeTable('interlude_scene', { id: scene.id }, { status: 'closed', hook: '', summary: '', entryCount: 0 })
+    }
+    const arcs = await this.ctx.database.get('interlude_arc', { storyId })
+    for (const arc of arcs) if (inRange(arc.createdAt) || inRange(arc.updatedAt)) await this.purgeTable('interlude_arc', { id: arc.id }, { status: 'closed', summary: '', sceneCount: 0 })
+
+    const patches = await this.ctx.database.get('interlude_state_patch', { storyId })
+    for (const patch of patches) if (inRange(patch.createdAt) || inRange(patch.appliedAt)) await this.purgeTable('interlude_state_patch', { id: patch.id }, { status: 'rejected', proposedValue: '[管理员已删除提案]', evidence: '' })
+
+    const story = await this.getStory(storyId)
+    await this.ensureContinuity(story, new Date())
+  }
+
   async receive(session: Session) {
+    if (this.databaseResetting) return false
     // Check before find/create so an unauthorized QQ can neither trigger the
     // model nor create a persistent story by merely sending a private message.
     if (!this.canHandleSession(session)) return false
@@ -454,51 +737,152 @@ export class InterludeService extends Service {
       return false
     }
     this.report('info', story, 'user-message', '收到参与者私聊消息 参与者=%s', participant.id)
+    if (this.config.logging?.logMessageContent) {
+      this.report('info', story, 'user-message', '用户消息内容：%s', session.content.slice(0, this.config.logging.previewLength))
+    }
 
-    const messages = await this.serial(story.id, async () => {
+    const accepted = await this.serial(story.id, async () => {
       const current = await this.getStory(story.id)
       const currentParticipant = await this.getParticipant(participant!.id)
-      if (!currentParticipant || currentParticipant.status !== 'active') return []
+      if (!currentParticipant || currentParticipant.status !== 'active') return undefined
       const now = new Date()
-      const from = new Date(current.cursorAt)
       const incomingParticipant = await this.recordIncomingMessage(currentParticipant, now)
       const superseded = this.config.runtime.cancelDelayedRepliesOnUserMessage
         ? await this.cancelPendingOutgoingMessages(current.id, incomingParticipant.id, now)
         : []
-      // A live message from A must not silently consume B's due reply. B's
-      // intent will be judged in its own scheduled turn and delivered to B.
-      const due = (await this.dueIntents(current.id, now))
-        .filter(intent => !intent.participantId || intent.participantId === incomingParticipant.id)
-
-      // 一次用户互动就是一次连续写作：模型同时补写 elapsed interval、接收
-      // 当前用户事件并决定互动结果，避免“补写”和“回复判断”各调用一次主模型。
-      const { decision, succeeded } = await this.tryDecide(current, incomingParticipant, 'user-message', from, now, session.content, due, superseded)
       await this.appendEntry(current.id, {
         kind: 'user-message', actor: 'user', content: session.content,
         occurredAt: now.toISOString(), metadata: { platform: session.platform, messageId: session.messageId, personId: incomingParticipant.personId },
       }, now, incomingParticipant.id)
-      const messages = await this.persistDecision(current, incomingParticipant, decision, from, now, true, 'user-message')
-      this.report('info', current, 'user-message', '主模型回合完成 参与者=%s 成功=%s 可见消息数=%d 回复模式=%s', incomingParticipant.id, succeeded, messages.length, decision.interaction?.reply.mode ?? 'none')
-      // 模型失败时不要推进游标：下一轮仍需补写这段尚未完成的生活，避免
-      // 短暂的网络/API 故障把一段真实时间永久跳过去。
-      if (succeeded) {
-        await this.ctx.database.set('interlude_story', { id: current.id }, { cursorAt: now, updatedAt: now })
-      }
-      // 每条用户消息都重新开始“对话静默计时”；若本回合安排了延迟回复，
-      // 则会把第一次生活补写推迟到那条回复完成后的静默期之后。
+      // Messages are persisted at arrival. The model request itself is
+      // debounced below, so a burst can become one coherent writing turn.
       await this.pauseAutomaticAdvanceAfterUserMessage(current.id, now)
-      if (succeeded && due.length) {
-        await this.ctx.database.set('interlude_intent', { id: { $in: due.map(intent => intent.id) } }, { status: 'completed', updatedAt: now })
-      }
-      return messages
+      return { story: current, participant: incomingParticipant, now, superseded }
     })
-    // Configuration can be edited while the model request is in flight. Do
-    // one final check before emitting the visible reply as well.
-    if (!this.canHandleSession(session)) return true
-    await this.sendOutgoingMessages(story, messages, participant, session)
-    // 压缩被排到当前故事队列末尾，但不 await；用户无需为低成本整理等待。
-    this.scheduleCompaction(story.id)
+    if (!accepted) return false
+    this.bufferUserNarrative(accepted.story, accepted.participant, session, accepted.now, accepted.superseded)
     return true
+  }
+
+  /**
+   * Persisted messages wait here briefly before they reach the narrator. This
+   * makes “你好 / 在吗 / 我有件事想问” one event without risking message loss.
+   */
+  private bufferUserNarrative(story: InterludeStory, participant: InterludeParticipant, session: Session, now: Date, supersededIntents: NarrativeIntent[]) {
+    const key = participant.id
+    const existing = this.bufferedNarrativeTurns.get(key)
+    const turn: BufferedNarrativeTurn = existing ?? {
+      storyId: story.id, participantId: participant.id, messages: [], nextRevision: 0, obsoleteRequestIds: new Set(),
+    }
+    const requestStartedAt = turn.inFlightStartedAt ?? 0
+    const staleWindow = Math.max(0, this.config.runtime.staleNarrativeRequestWindowSeconds ?? 5) * Time.second
+    if (turn.inFlightRequestId && staleWindow > 0 && now.getTime() - requestStartedAt <= staleWindow) {
+      turn.obsoleteRequestIds.add(turn.inFlightRequestId)
+      this.report('info', story, 'user-message', '收到连续消息，旧主模型请求已过期 参与者=%s 请求=%d', participant.id, turn.inFlightRequestId)
+    }
+    turn.messages.push({ content: session.content, occurredAt: now, supersededIntents })
+    turn.latestSession = session
+    if (turn.timer) turn.timer()
+    const revision = ++turn.nextRevision
+    const delay = Math.max(0, this.config.runtime.userMessageDebounceSeconds ?? 2) * Time.second
+    turn.timer = this.ctx.setTimeout(() => void this.flushBufferedNarrative(key, revision), delay)
+    this.bufferedNarrativeTurns.set(key, turn)
+    this.report('debug', story, 'user-message', '已合并短时消息 参与者=%s 待处理=%d 等待=%dms', participant.id, turn.messages.length, delay)
+  }
+
+  /** Prevent timers or already-returning model calls from resurrecting data
+   * after an administrator resets the story or clears HDSI tables. */
+  private invalidateBufferedNarratives(storyId?: string) {
+    for (const [key, turn] of this.bufferedNarrativeTurns) {
+      if (storyId && turn.storyId !== storyId) continue
+      if (turn.timer) turn.timer()
+      if (turn.inFlightRequestId) turn.obsoleteRequestIds.add(turn.inFlightRequestId)
+      this.bufferedNarrativeTurns.delete(key)
+    }
+  }
+
+  private async flushBufferedNarrative(key: string, revision: number) {
+    if (this.databaseResetting) return
+    const turn = this.bufferedNarrativeTurns.get(key)
+    if (!turn || turn.nextRevision !== revision) return
+    // One shared story has one narrator at a time. If another relationship is
+    // currently waiting on the provider, keep this batch intact and retry
+    // shortly instead of taking an inconsistent cursor snapshot.
+    if (this.narratingStories.has(turn.storyId)) {
+      turn.timer = this.ctx.setTimeout(() => void this.flushBufferedNarrative(key, revision), 250)
+      return
+    }
+    this.narratingStories.add(turn.storyId)
+    turn.timer = undefined
+    const batch = turn.messages.splice(0)
+    if (!batch.length) {
+      this.narratingStories.delete(turn.storyId)
+      return
+    }
+    const requestId = revision
+    turn.inFlightRequestId = requestId
+    turn.inFlightStartedAt = Date.now()
+    try {
+      // Snapshot only the lightweight decision inputs under the story lock.
+      // The network request stays outside it, so a new user message can be
+      // recorded immediately and invalidate this request when appropriate.
+      const snapshot = await this.serial(turn.storyId, async () => {
+        const story = await this.getStory(turn.storyId)
+        const participant = await this.getParticipant(turn.participantId)
+        if (!participant || participant.status !== 'active' || story.status !== 'active') return undefined
+        const now = new Date()
+        const due = (await this.dueIntents(story.id, now))
+          .filter(intent => !intent.participantId || intent.participantId === participant.id)
+        return { story, participant, from: new Date(story.cursorAt), now, due }
+      })
+      if (!snapshot) return
+
+      const userMessage = formatBufferedUserMessages(batch)
+      const superseded = batch.flatMap(message => message.supersededIntents)
+      const { decision, succeeded } = await this.tryDecide(
+        snapshot.story, snapshot.participant, 'user-message', snapshot.from, snapshot.now, userMessage, snapshot.due, superseded,
+      )
+
+      const result = await this.serial(turn.storyId, async () => {
+        if (this.databaseResetting) return { obsolete: true, messages: [] as OutgoingMessageDraft[] }
+        if (turn.obsoleteRequestIds.has(requestId)) return { obsolete: true, messages: [] as OutgoingMessageDraft[] }
+        const current = await this.getStory(turn.storyId)
+        const currentParticipant = await this.getParticipant(turn.participantId)
+        if (!currentParticipant || currentParticipant.status !== 'active' || current.status !== 'active') {
+          return { obsolete: true, messages: [] as OutgoingMessageDraft[] }
+        }
+        const now = new Date()
+        const messages = await this.persistDecision(current, currentParticipant, decision, snapshot.from, snapshot.now, true, 'user-message')
+        if (succeeded) {
+          await this.dbSet('interlude_story', { id: current.id }, { cursorAt: snapshot.now, updatedAt: now })
+          if (snapshot.due.length) await this.dbSet('interlude_intent', { id: { $in: snapshot.due.map(intent => intent.id) } }, { status: 'completed', updatedAt: now })
+        } else {
+          await this.scheduleNarrativeRetry(current.id, currentParticipant.id, now)
+        }
+        await this.pauseAutomaticAdvanceAfterUserMessage(current.id, now)
+        this.report('info', current, 'user-message', '合并写作回合完成 参与者=%s 消息数=%d 成功=%s 可见消息=%d', currentParticipant.id, batch.length, succeeded, messages.length)
+        return { obsolete: false, messages }
+      })
+
+      if (result.obsolete) {
+        this.report('info', snapshot.story, 'user-message', '已丢弃过期主模型结果 参与者=%s 请求=%d', snapshot.participant.id, requestId)
+        return
+      }
+      if (this.canHandleParticipant(snapshot.participant)) {
+        await this.sendOutgoingMessages(snapshot.story, result.messages, snapshot.participant, turn.latestSession)
+      }
+      this.scheduleCompaction(turn.storyId)
+    } catch (error) {
+      this.reportStandalone('warn', '合并写作任务失败：参与者=%s 错误=%s', turn.participantId, error)
+    } finally {
+      if (turn.inFlightRequestId === requestId) {
+        turn.inFlightRequestId = undefined
+        turn.inFlightStartedAt = undefined
+        this.narratingStories.delete(turn.storyId)
+      }
+      turn.obsoleteRequestIds.delete(requestId)
+      if (!turn.messages.length && !turn.timer && !turn.inFlightRequestId) this.bufferedNarrativeTurns.delete(key)
+    }
   }
 
   async advanceStory(story: InterludeStory, force = true) {
@@ -521,15 +905,12 @@ export class InterludeService extends Service {
   }
 
   async sweep() {
-    const stories = await this.ctx.database.get('interlude_story', { status: 'active' }, {
-      limit: Math.max(1, this.config.runtime.maxStoriesPerSweep),
-      sort: { cursorAt: 'asc' },
-    })
-    for (const story of stories) {
-      if (!this.canHandleStory(story)) continue
-      const messages = await this.advanceStory(story, false)
-      if (messages.length) await this.sendScheduledMessages(story, messages)
-    }
+    if (this.databaseResetting) return
+    const story = await this.getCanonicalStory()
+    if (!story || !this.canHandleStory(story)) return
+    if (this.narratingStories.has(story.id)) return
+    const messages = await this.advanceStory(story, false)
+    if (messages.length) await this.sendScheduledMessages(story, messages)
   }
 
   private async advanceUnlocked(story: InterludeStory, now: Date, force: boolean) {
@@ -547,7 +928,7 @@ export class InterludeService extends Service {
       const { decision, succeeded } = await this.tryDecide(story, null, 'advance', from, now, undefined, [])
       if (succeeded) {
         messages.push(...await this.persistDecision(story, null, decision, from, now, this.config.runtime.allowProactiveMessages, 'advance'))
-        await this.ctx.database.set('interlude_story', { id: story.id }, { cursorAt: now, updatedAt: now })
+        await this.dbSet('interlude_story', { id: story.id }, { cursorAt: now, updatedAt: now })
         advanced = true
       }
     }
@@ -565,8 +946,8 @@ export class InterludeService extends Service {
       const permitMessages = this.config.runtime.allowProactiveMessages || dueBatch.some(intent => intent.payload?.userInitiated === true)
       messages.push(...await this.persistDecision(current, dueParticipant ?? null, decision, dueFrom, now, permitMessages, 'intent-due'))
       if (succeeded) {
-        await this.ctx.database.set('interlude_story', { id: current.id }, { cursorAt: now, updatedAt: now })
-        await this.ctx.database.set('interlude_intent', { id: { $in: dueBatch.map(intent => intent.id) } }, { status: 'completed', updatedAt: now })
+        await this.dbSet('interlude_story', { id: current.id }, { cursorAt: now, updatedAt: now })
+        await this.dbSet('interlude_intent', { id: { $in: dueBatch.map(intent => intent.id) } }, { status: 'completed', updatedAt: now })
         if (dueBatch.some(intent => intent.type === 'delayed-reply')) {
           delayedReplyProcessed = true
           await this.pauseAutomaticAdvanceAfterDelayedReply(story.id, now)
@@ -574,8 +955,16 @@ export class InterludeService extends Service {
           await this.scheduleNextAutomaticAdvance(story.id, now)
         }
       } else {
-        // Leave this and later batches pending so the next sweep can retry
-        // after a transient model/provider failure.
+        // A failed user turn gets a persisted retry. Otherwise a transient
+        // 403/5xx would leave its already-recorded incoming message waiting
+        // forever for somebody to send another DM.
+        const retries = dueBatch.filter(intent => intent.type === 'narrative-retry')
+        if (retries.length) {
+          const attempts = Math.max(...retries.map(intent => Number(intent.payload?.attempt) || 0))
+          await this.dbSet('interlude_intent', { id: { $in: retries.map(intent => intent.id) } }, { status: 'cancelled', updatedAt: now })
+          await this.scheduleNarrativeRetry(current.id, dueParticipant?.id ?? '', now, attempts)
+        }
+        // Keep ordinary delayed plans pending until the provider recovers.
         break
       }
     }
@@ -589,11 +978,13 @@ export class InterludeService extends Service {
     // 同时还在与谁维系关系，而不是把每个 QQ 当成独立世界。
     const factQuery = createFactQuery(participant, userMessage, dueIntents, supersededIntents)
     const [recentEntries, memories, scene, arc, facts, allParticipants] = await Promise.all([
-      this.recentEntries(story.id, this.memoryConfig.recentEntryLimit),
-      this.memories(story.id, this.memoryConfig.factLimit, participant?.id),
+      // Use the runtime limits on the live path.  They are the options shown
+      // to testers as “上下文条目/长期事实”，and should be authoritative.
+      this.recentEntries(story.id, this.config.runtime.contextEntryLimit),
+      this.memories(story.id, this.config.runtime.memoryLimit, participant?.id),
       this.activeScene(story.id),
       this.activeArc(story.id),
-      this.facts(story.id, this.memoryConfig.factLimit, factQuery, participant?.id),
+      this.facts(story.id, this.config.runtime.memoryLimit, factQuery, participant?.id),
       this.participants(story.id),
     ])
     const visibleEntries = this.sharedStoryConfig.shareParticipantDetails
@@ -619,8 +1010,8 @@ export class InterludeService extends Service {
         decision: await this.decide(story, participant, phase, from, now, userMessage, dueIntents, supersededIntents),
         succeeded: true,
       }
-      if (this.config.logging.logScriptPreview && result.decision.script) {
-        this.report('debug', story, phase, '剧本预览：%s', result.decision.script.slice(0, this.config.logging.previewLength))
+      if (this.config.logging?.logScriptPreview && result.decision.script) {
+        this.report('info', story, phase, '当前剧本内容：\n%s', result.decision.script.slice(0, this.config.logging.previewLength))
       }
       this.report('info', story, phase, '主模型决策完成 参与者=%s 剧本字数=%d', participant?.id || '全局', result.decision.script?.length ?? 0)
       return result
@@ -701,7 +1092,7 @@ export class InterludeService extends Service {
 
   private async appendEntry(storyId: string, entry: ScriptEntryDraft, now: Date, participantId = '') {
     const occurredAt = toDate(entry.occurredAt) ?? now
-    await this.ctx.database.create('interlude_script_entry', {
+    await this.dbCreate('interlude_script_entry', {
       storyId, participantId, kind: clip(entry.kind, 32) || 'life', actor: clip(entry.actor ?? 'character', 32),
       content: clip(entry.content, 12_000), occurredAt,
       metadata: isRecord(entry.metadata) ? entry.metadata : {}, createdAt: now,
@@ -709,14 +1100,14 @@ export class InterludeService extends Service {
     // entryCount 只统计当前活动场景自上次压缩后的新增原始记录，用于触发后台压缩。
     const scene = await this.activeScene(storyId)
     if (scene) {
-      await this.ctx.database.set('interlude_scene', { id: scene.id }, {
+      await this.dbSet('interlude_scene', { id: scene.id }, {
         entryCount: scene.entryCount + 1, updatedAt: now,
       })
     }
   }
 
   private async appendMemory(storyId: string, memory: MemoryDraft, now: Date, participantId = '') {
-    await this.ctx.database.create('interlude_memory', {
+    await this.dbCreate('interlude_memory', {
       storyId, participantId, category: clip(memory.category, 32) || 'fact', content: clip(memory.content, 4_000),
       importance: clampNumber(memory.importance, 0.5, 0, 1), status: 'active', sourceEntryId: null,
       createdAt: now, updatedAt: now,
@@ -730,12 +1121,20 @@ export class InterludeService extends Service {
    * semantic score of zero for this turn.
    */
   async facts(storyId: string, limit = this.memoryConfig.factLimit, query = '', participantId?: string) {
-    const candidateLimit = Math.max(50, Math.min(limit * 8, this.memoryConfig.maxFactsPerStory, 500))
+    // The previous floor of 50 caused every live turn to scan a large slice of
+    // the facts table, even when the narrator only needed a handful of facts.
+    // Keep enough candidates for semantic re-ranking without making the
+    // latency-sensitive path do unnecessary database work.
+    const candidateLimit = Math.max(20, Math.min(limit * 5, this.memoryConfig.maxFactsPerStory, 300))
     const rows = await this.ctx.database.get('interlude_fact', { storyId, status: 'active' }, {
       limit: candidateLimit,
       sort: { importance: 'desc', updatedAt: 'desc' },
     })
-    const queryEmbedding = query.trim() ? await this.embedText(query) : []
+    // Live embedding adds an extra HTTP request to every user turn. Keep it
+    // opt-in; stored fact vectors and background backfill still work normally.
+    const queryEmbedding = query.trim() && this.config.model.embedding?.liveQuery
+      ? await this.embedText(query)
+      : []
     return rows
       .filter(fact => participantId === undefined || !fact.participantId || fact.participantId === participantId)
       .map(fact => ({ fact, score: factScore(fact, this.memoryConfig, queryEmbedding) }))
@@ -765,10 +1164,33 @@ export class InterludeService extends Service {
   private async appendIntent(storyId: string, intent: IntentDraft, now: Date, participantId = '') {
     const notBefore = toDate(intent.notBefore)
     if (!notBefore || notBefore <= now) return
-    await this.ctx.database.create('interlude_intent', {
+    await this.dbCreate('interlude_intent', {
       storyId, participantId, type: clip(intent.type, 32) || 'follow-up', summary: clip(intent.summary, 4_000), notBefore,
       status: 'pending', payload: isRecord(intent.payload) ? intent.payload : {}, createdAt: now, updatedAt: now,
     })
+  }
+
+  /** Persist a bounded retry so a transient provider failure cannot strand a user turn. */
+  private async scheduleNarrativeRetry(storyId: string, participantId: string, now: Date, previousAttempts = 0) {
+    const delaySeconds = Math.max(5, this.config.runtime.narrativeRetryDelaySeconds ?? 60)
+    const maxAttempts = Math.max(0, this.config.runtime.narrativeRetryMaxAttempts ?? 6)
+    const pending = await this.ctx.database.get('interlude_intent', { storyId, participantId, status: 'pending' })
+    const existing = pending.filter(intent => intent.type === 'narrative-retry')
+    if (existing.length) await this.dbSet('interlude_intent', { id: { $in: existing.map(intent => intent.id) } }, { status: 'cancelled', updatedAt: now })
+    if (!participantId || previousAttempts >= maxAttempts) {
+      this.reportStandalone('warn', '叙事模型自动重试已停止：故事=%s 参与者=%s 已尝试=%d 上限=%d', storyId, participantId || '全局', previousAttempts, maxAttempts)
+      return false
+    }
+    const attempt = previousAttempts + 1
+    const notBefore = new Date(now.getTime() + delaySeconds * Time.second)
+    await this.appendIntent(storyId, {
+      type: 'narrative-retry',
+      summary: `Retry the interrupted narrative turn after provider failure (attempt ${attempt}/${maxAttempts}).`,
+      notBefore: notBefore.toISOString(),
+      payload: { narrativeRetry: true, userInitiated: true, attempt },
+    }, now, participantId)
+    this.reportStandalone('warn', '叙事模型请求失败，已安排自动重试：故事=%s 参与者=%s 第%d/%d次，%d秒后执行', storyId, participantId, attempt, maxAttempts, delaySeconds)
+    return true
   }
 
   private async dueIntents(storyId: string, now: Date) {
@@ -785,7 +1207,7 @@ export class InterludeService extends Service {
       && (intent.type === 'delayed-reply' || intent.type === 'cross-conversation-message'))
     if (!matching.length) return matching
 
-    await this.ctx.database.set('interlude_intent', { id: { $in: matching.map(intent => intent.id) } }, {
+    await this.dbSet('interlude_intent', { id: { $in: matching.map(intent => intent.id) } }, {
       status: 'cancelled',
       updatedAt: now,
     })
@@ -824,8 +1246,23 @@ export class InterludeService extends Service {
         this.report('warn', story, 'intent-due', '消息被当前账号白名单拦截 参与者=%s', target.id)
         continue
       }
+      const segments = this.splitOutgoingMessage(message.content)
+      if (segments.length > 1) {
+        await this.deliverSegment(story, target, segments[0], current, session)
+        let totalDelay = 0
+        for (const segment of segments.slice(1)) {
+          totalDelay += this.typingDelayMilliseconds(segment)
+          // Later bubbles use the bot route instead of the original Session:
+          // the incoming middleware has already returned by then.
+          this.ctx.setTimeout(() => void this.deliverSegment(story, target, segment), totalDelay)
+        }
+        continue
+      }
       try {
         this.report('info', story, 'intent-due', '正在投递可见消息 参与者=%s', target.id)
+        if (this.config.logging?.logMessageContent) {
+          this.report('info', story, 'intent-due', '主角消息内容：%s', message.content.slice(0, this.config.logging.previewLength))
+        }
         if (session && current?.id === target.id) {
           await session.send(message.content)
           continue
@@ -839,6 +1276,41 @@ export class InterludeService extends Service {
       } catch (error) {
           this.report('warn', story, 'intent-due', '消息投递失败 参与者=%s 错误=%s', target.id, error)
       }
+    }
+  }
+
+  private splitOutgoingMessage(content: string) {
+    if (this.config.runtime.splitReplyMessages === false) return [content]
+    const separator = this.config.runtime.messageSeparator?.trim() || '<sep/>'
+    if (!separator || !content.includes(separator)) return [content]
+    return content.split(separator).map(part => part.trim()).filter(Boolean)
+  }
+
+  private typingDelayMilliseconds(nextSegment: string) {
+    const baseSeconds = Math.max(0, this.config.runtime.typingBaseDelaySeconds ?? 1)
+    const charactersPerSecond = Math.max(1, this.config.runtime.typingCharactersPerSecond ?? 8)
+    const maximumSeconds = Math.max(baseSeconds, this.config.runtime.typingMaxDelaySeconds ?? 12)
+    const seconds = Math.min(maximumSeconds, baseSeconds + Math.ceil(nextSegment.length / charactersPerSecond))
+    return seconds * Time.second
+  }
+
+  /** Deliver a separated chat bubble without blocking the next narrative turn. */
+  private async deliverSegment(story: InterludeStory, target: InterludeParticipant, content: string, current?: InterludeParticipant, session?: Session) {
+    try {
+      this.report('info', story, 'intent-due', '正在投递分段消息 参与者=%s', target.id)
+      if (this.config.logging?.logMessageContent) this.report('info', story, 'intent-due', '主角消息内容：%s', content.slice(0, this.config.logging.previewLength))
+      if (session && current?.id === target.id) {
+        await session.send(content)
+        return
+      }
+      const bot = this.findBotForParticipant(target)
+      if (!bot) {
+        this.report('warn', story, 'intent-due', '没有可用机器人账号投递分段消息 参与者=%s', target.id)
+        return
+      }
+      await bot.sendMessage(target.channelId, content)
+    } catch (error) {
+      this.report('warn', story, 'intent-due', '分段消息投递失败 参与者=%s 错误=%s', target.id, error)
     }
   }
 
@@ -901,7 +1373,7 @@ export class InterludeService extends Service {
       nextAdvanceAt: quietUntil.toISOString(),
       ...(recordUserMessage ? { lastUserMessageAt: now.toISOString() } : {}),
     }
-    await this.ctx.database.set('interlude_story', { id: story.id }, { state: { ...story.state, automation }, updatedAt: now })
+    await this.dbSet('interlude_story', { id: story.id }, { state: { ...story.state, automation }, updatedAt: now })
   }
 
   private async scheduleNextAutomaticAdvance(storyId: string, now: Date) {
@@ -916,11 +1388,15 @@ export class InterludeService extends Service {
       lastAutoAdvanceAt: now.toISOString(),
       nextAdvanceAt: nextAdvanceAt.toISOString(),
     }
-    await this.ctx.database.set('interlude_story', { id: story.id }, { state: { ...story.state, automation }, updatedAt: now })
+    await this.dbSet('interlude_story', { id: story.id }, { state: { ...story.state, automation }, updatedAt: now })
   }
 
   private get sharedStoryConfig(): SharedStoryConfig {
+    const { enabled: _legacyEnabled, ...overrides } = this.config.sharedStory ?? {}
     return {
+      // Beta2 deliberately keeps the single-story guard hard-enabled. Older
+      // builds exposed a rollback switch here, but turning it off could create
+      // fresh per-account stories that a later background sweep would revive.
       enabled: true,
       autoEnrollParticipants: true,
       allowCrossConversationMessages: true,
@@ -929,13 +1405,47 @@ export class InterludeService extends Service {
       participantContextLimit: 6,
       managerAccounts: [],
       participantPresets: [],
-      ...(this.config.sharedStory ?? {}),
+      ...overrides,
     }
   }
 
   private participantPreset(userId: string) {
     return (this.sharedStoryConfig.participantPresets ?? []).find(preset =>
       preset.enabled !== false && normalizeAccountId(preset.qq) === normalizeAccountId(userId))
+  }
+
+  /** The clean Canon used both by story creation and a full administrative reset. */
+  private initialStorySetting(name?: string): StorySetting {
+    const setting = emptyStorySetting()
+    const defaults = this.config.storyDefaults
+    setting.character.name = name?.trim() || defaults.characterName || setting.character.name
+    setting.character.profile = defaults.characterProfile
+    setting.user.displayName = 'Multiple participants'
+    setting.user.profile = defaults.userProfile
+    setting.relationship = defaults.relationship
+    setting.world = defaults.world
+    setting.supportingCast = defaults.supportingCast
+    setting.location = defaults.location
+    setting.style = defaults.style || setting.style
+    setting.timezone = defaults.timezone || setting.timezone
+    return setting
+  }
+
+  /** Rebuild per-account relationship baselines and discard evolving state. */
+  private async resetParticipantCanon(storyId: string, now: Date) {
+    const participants = await this.ctx.database.get('interlude_participant', { storyId })
+    for (const participant of participants) {
+      const account = this.userAccountRule(participant.userId)
+      const preset = this.participantPreset(participant.userId)
+      await this.dbSet('interlude_participant', { id: participant.id }, {
+        personId: account?.personId?.trim() || preset?.personId?.trim() || participant.personId || participant.userId,
+        displayName: account?.label?.trim() || preset?.label?.trim() || participant.displayName || participant.userId,
+        profile: account?.profile?.trim() || preset?.profile?.trim() || this.config.storyDefaults.userProfile,
+        relationship: account?.relationship?.trim() || preset?.relationship?.trim() || this.config.storyDefaults.relationship,
+        state: emptyParticipantState(),
+        updatedAt: now,
+      })
+    }
   }
 
   private userAccountRule(userId: string) {
@@ -956,14 +1466,14 @@ export class InterludeService extends Service {
       pendingReplyCount: current.pendingReplyCount + 1,
       lastUserMessageAt: now.toISOString(),
     }
-    await this.ctx.database.set('interlude_participant', { id: participant.id }, { state, updatedAt: now })
+    await this.dbSet('interlude_participant', { id: participant.id }, { state, updatedAt: now })
     return { ...participant, state, updatedAt: now }
   }
 
   private async markParticipantSeen(participant: InterludeParticipant, now: Date) {
     const current = normalizeParticipantState(participant.state)
     const state: ParticipantState = { ...current, unreadMessageCount: 0 }
-    await this.ctx.database.set('interlude_participant', { id: participant.id }, { state, updatedAt: now })
+    await this.dbSet('interlude_participant', { id: participant.id }, { state, updatedAt: now })
     return { ...participant, state, updatedAt: now }
   }
 
@@ -973,13 +1483,13 @@ export class InterludeService extends Service {
       ...current, unreadMessageCount: 0, pendingReplyCount: 0,
       lastCharacterMessageAt: now.toISOString(),
     }
-    await this.ctx.database.set('interlude_participant', { id: participant.id }, { state, updatedAt: now })
+    await this.dbSet('interlude_participant', { id: participant.id }, { state, updatedAt: now })
     return { ...participant, state, updatedAt: now }
   }
 
   private async updateParticipantState(participant: InterludeParticipant, patch: Partial<ParticipantState>, now: Date) {
     const state = mergeParticipantState(normalizeParticipantState(participant.state), patch)
-    await this.ctx.database.set('interlude_participant', { id: participant.id }, { state, updatedAt: now })
+    await this.dbSet('interlude_participant', { id: participant.id }, { state, updatedAt: now })
     return { ...participant, state, updatedAt: now }
   }
 
@@ -1004,7 +1514,7 @@ export class InterludeService extends Service {
       updatedAt: now,
     }
     try {
-      await this.ctx.database.create('interlude_story', story)
+      await this.dbCreate('interlude_story', story)
     } catch (error) {
       // Concurrent first visits from two legacy accounts can both decide that
       // no shared row exists.  Join the row that won the primary-key race and
@@ -1020,13 +1530,13 @@ export class InterludeService extends Service {
       'interlude_script_entry', 'interlude_memory', 'interlude_intent',
       'interlude_scene', 'interlude_arc', 'interlude_fact', 'interlude_state_patch',
     ] as const
-    for (const table of tables) await this.ctx.database.set(table, { storyId: legacy.id }, { storyId: story.id } as any)
+    for (const table of tables) await this.dbSet(table, { storyId: legacy.id }, { storyId: story.id } as any)
     // The old story only had one user, so account-bound records can safely be
     // attached to that initial relationship branch during migration.
     for (const table of ['interlude_script_entry', 'interlude_memory', 'interlude_intent', 'interlude_fact', 'interlude_state_patch'] as const) {
-      await this.ctx.database.set(table, { storyId: story.id }, { participantId: participant.id } as any)
+      await this.dbSet(table, { storyId: story.id }, { participantId: participant.id } as any)
     }
-    await this.ctx.database.set('interlude_story', { id: legacy.id }, { status: 'archived', updatedAt: now })
+    await this.dbSet('interlude_story', { id: legacy.id }, { status: 'archived', updatedAt: now })
     await this.ensureContinuity(story, now)
     return story
   }
@@ -1045,9 +1555,9 @@ export class InterludeService extends Service {
     const now = new Date()
     const participant = await this.ensureParticipant(story, session, now)
     for (const table of ['interlude_script_entry', 'interlude_memory', 'interlude_intent', 'interlude_fact', 'interlude_state_patch'] as const) {
-      await this.ctx.database.set(table, { storyId: legacy.id }, { storyId: story.id, participantId: participant.id } as any)
+      await this.dbSet(table, { storyId: legacy.id }, { storyId: story.id, participantId: participant.id } as any)
     }
-    await this.ctx.database.set('interlude_story', { id: legacy.id }, { status: 'archived', updatedAt: now })
+    await this.dbSet('interlude_story', { id: legacy.id }, { status: 'archived', updatedAt: now })
     await this.appendEntry(story.id, {
       kind: 'legacy-branch-merged', actor: 'system',
       content: `Earlier account-specific history for ${participant.displayName} was merged into the shared story.`,
@@ -1092,7 +1602,7 @@ export class InterludeService extends Service {
     // 此方法负责补齐它们，并把 id 缓存在 story.state 供 Console/外部工具查看。
     let arc = await this.activeArc(story.id)
     if (!arc) {
-      await this.ctx.database.create('interlude_arc', {
+      await this.dbCreate('interlude_arc', {
         storyId: story.id, status: 'active', title: 'Beginning', summary: '', sceneCount: 0,
         createdAt: now, updatedAt: now,
       })
@@ -1100,24 +1610,29 @@ export class InterludeService extends Service {
     }
     let scene = await this.activeScene(story.id)
     if (!scene) {
-      await this.ctx.database.create('interlude_scene', {
+      await this.dbCreate('interlude_scene', {
         storyId: story.id, status: 'active', startedAt: now, endedAt: null,
         hook: '', summary: '', entryCount: 0, lastEntryId: null, createdAt: now, updatedAt: now,
       })
       scene = await this.activeScene(story.id)
-      if (arc) await this.ctx.database.set('interlude_arc', { id: arc.id }, { sceneCount: arc.sceneCount + 1, updatedAt: now })
+      if (arc) await this.dbSet('interlude_arc', { id: arc.id }, { sceneCount: arc.sceneCount + 1, updatedAt: now })
     }
     if (arc && scene && (story.state.activeArcId !== arc.id || story.state.activeSceneId !== scene.id)) {
       const state = { ...story.state, activeArcId: arc.id, activeSceneId: scene.id }
-      await this.ctx.database.set('interlude_story', { id: story.id }, { state, updatedAt: now })
+      await this.dbSet('interlude_story', { id: story.id }, { state, updatedAt: now })
     }
   }
 
   private scheduleCompaction(storyId: string) {
     if (!this.memoryConfig.enabled) return
+    if (this.narratingStories.has(storyId)) {
+      this.ctx.setTimeout(() => this.scheduleCompaction(storyId), 500)
+      return
+    }
     // 不 await 的关键在于：把工作放入同一故事的串行队列，既避免与新消息竞争，
     // 又不把压缩模型的等待时间加入刚刚结束的私聊响应。
     void this.serial(storyId, async () => {
+      if (this.narratingStories.has(storyId)) return
       const story = await this.getStory(storyId)
       await this.compactUnlocked(story, new Date(), false)
     }).catch(error => this.serviceLogger.debug('记忆压缩跳过：%s', error))
@@ -1125,15 +1640,10 @@ export class InterludeService extends Service {
 
   private async compactStories() {
     if (!this.memoryConfig.enabled) return
-    const stories = await this.ctx.database.get('interlude_story', { status: 'active' }, {
-      limit: Math.max(1, this.memoryConfig.maxStoriesPerCompactionRun),
-      sort: { updatedAt: 'asc' },
-    })
-    for (const story of stories) {
-      if (!this.canHandleStory(story)) continue
-      this.scheduleFactEmbeddingBackfill(story.id)
-      this.scheduleCompaction(story.id)
-    }
+    const story = await this.getCanonicalStory()
+    if (!story || !this.canHandleStory(story)) return
+    this.scheduleFactEmbeddingBackfill(story.id)
+    this.scheduleCompaction(story.id)
   }
 
   private async compactUnlocked(story: InterludeStory, now: Date, force: boolean) {
@@ -1180,18 +1690,18 @@ export class InterludeService extends Service {
   private async persistCompaction(story: InterludeStory, scene: InterludeScene, decision: CompactionDecision, entries: ScriptEntry[], now: Date) {
     // 摘要更新成功后才移动 lastEntryId，确保失败时原始条目仍会在下次被重新处理。
     const scenePatch = decision.scene ?? {}
-    await this.ctx.database.set('interlude_scene', { id: scene.id }, {
+    await this.dbSet('interlude_scene', { id: scene.id }, {
       hook: clip(scenePatch.hook ?? scene.hook, this.memoryConfig.sceneHookCharacters),
       summary: clip(scenePatch.summary ?? scene.summary, this.memoryConfig.sceneSummaryCharacters),
       entryCount: 0, lastEntryId: entries.at(-1)?.id ?? scene.lastEntryId, updatedAt: now,
     })
     if (scenePatch.close) {
-      await this.ctx.database.set('interlude_scene', { id: scene.id }, { status: 'closed', endedAt: now, updatedAt: now })
+      await this.dbSet('interlude_scene', { id: scene.id }, { status: 'closed', endedAt: now, updatedAt: now })
       await this.ensureContinuity(story, now)
     }
     const arc = await this.activeArc(story.id)
     if (arc && decision.arc) {
-      await this.ctx.database.set('interlude_arc', { id: arc.id }, {
+      await this.dbSet('interlude_arc', { id: arc.id }, {
         title: clip(decision.arc.title ?? arc.title, 255), summary: clip(decision.arc.summary ?? arc.summary, this.memoryConfig.arcSummaryCharacters), updatedAt: now,
       })
     }
@@ -1212,7 +1722,7 @@ export class InterludeService extends Service {
     const unresolved = draft.unresolved === true || (draft.unresolved === undefined && draft.scope === 'promise')
     if (same) {
       const embedding = same.embedding?.length ? same.embedding : await this.embedText(content)
-      await this.ctx.database.set('interlude_fact', { id: same.id }, {
+      await this.dbSet('interlude_fact', { id: same.id }, {
         importance: Math.max(same.importance, clampNumber(draft.importance, same.importance, 0, 1)),
         confidence: Math.max(same.confidence, clampNumber(draft.confidence, same.confidence, 0, 1)),
         unresolved: same.unresolved || unresolved,
@@ -1223,9 +1733,9 @@ export class InterludeService extends Service {
     }
     if (existing.length >= this.memoryConfig.maxFactsPerStory) {
       const oldest = existing.sort((a, b) => (a.importance * a.confidence) - (b.importance * b.confidence))[0]
-      if (oldest) await this.ctx.database.set('interlude_fact', { id: oldest.id }, { status: 'superseded', updatedAt: now })
+      if (oldest) await this.dbSet('interlude_fact', { id: oldest.id }, { status: 'superseded', updatedAt: now })
     }
-    await this.ctx.database.create('interlude_fact', {
+    await this.dbCreate('interlude_fact', {
       storyId, participantId, scope: draft.scope, content, importance: clampNumber(draft.importance, 0.5, 0, 1),
       confidence: clampNumber(draft.confidence, 0.5, 0, 1), unresolved,
       embedding: await this.embedText(content), status: 'active', sourceEntryIds,
@@ -1264,7 +1774,7 @@ export class InterludeService extends Service {
       .slice(0, Math.max(0, batchSize))
     for (const fact of missing) {
       const embedding = await this.embedText(fact.content)
-      if (embedding.length) await this.ctx.database.set('interlude_fact', { id: fact.id }, { embedding, updatedAt: new Date() })
+      if (embedding.length) await this.dbSet('interlude_fact', { id: fact.id }, { embedding, updatedAt: new Date() })
     }
   }
 
@@ -1272,7 +1782,7 @@ export class InterludeService extends Service {
     const confidence = clampNumber(draft.confidence, 0, 0, 1)
     const participantId = resolveParticipantId(draft.participantId, draft.sourceEntryIds, entries)
     const sourceEntryIds = (draft.sourceEntryIds ?? []).filter(id => entries.some(entry => entry.id === id)).slice(0, 20)
-    const proposal = await this.ctx.database.create('interlude_state_patch', {
+    const proposal = await this.dbCreate('interlude_state_patch', {
       storyId: story.id, participantId, target: draft.target, path: clip(draft.path, 255), proposedValue: clip(draft.proposedValue, 4_000),
       evidence: clip(draft.evidence, 4_000), confidence, impact: draft.impact === 'major' ? 'major' : 'minor',
       status: 'proposed', sourceEntryIds, createdAt: now, appliedAt: null,
@@ -1290,7 +1800,7 @@ export class InterludeService extends Service {
       const participant = await this.getParticipant(participantId)
       if (participant) {
         const state = normalizeParticipantState(participant.state)
-        await this.ctx.database.set('interlude_participant', { id: participant.id }, {
+        await this.dbSet('interlude_participant', { id: participant.id }, {
           state: { ...state, relationshipOverlay: mergeNote(state.relationshipOverlay, draft.proposedValue) }, updatedAt: now,
         })
       }
@@ -1298,9 +1808,9 @@ export class InterludeService extends Service {
     else overlay.world = mergeNote(overlay.world, draft.proposedValue)
     if (draft.target !== 'relationship' || !participantId) {
       const state = { ...story.state, settingOverlay: overlay }
-      await this.ctx.database.set('interlude_story', { id: story.id }, { state, updatedAt: now })
+      await this.dbSet('interlude_story', { id: story.id }, { state, updatedAt: now })
     }
-    if (proposal?.id) await this.ctx.database.set('interlude_state_patch', { id: proposal.id }, { status: 'applied', appliedAt: now })
+    if (proposal?.id) await this.dbSet('interlude_state_patch', { id: proposal.id }, { status: 'applied', appliedAt: now })
   }
 
   private report(level: 'error' | 'warn' | 'info' | 'debug', story: InterludeStory, phase: NarrativeRequest['phase'], message: string, ...args: unknown[]) {
@@ -1345,6 +1855,51 @@ export class InterludeService extends Service {
     )
     return current
   }
+
+  private dbWrite<T>(task: () => Promise<T>) {
+    const run = this.databaseWriteQueue.then(() => this.retryDbWrite(task), () => this.retryDbWrite(task))
+    this.databaseWriteQueue = run.catch(() => undefined)
+    return run
+  }
+
+  private async retryDbWrite<T>(task: () => Promise<T>) {
+    for (let attempt = 0; ; attempt++) {
+      try {
+        return await task()
+      } catch (error) {
+        if (attempt >= 2 || !isTransientDatabaseError(error)) throw error
+        const delay = 50 * 2 ** attempt
+        this.serviceLogger.warn('SQLite 写入暂时失败，%dms 后重试（第 %d 次）：%s', delay, attempt + 1, error)
+        await new Promise(resolve => setTimeout(resolve, delay))
+      }
+    }
+  }
+
+  private dbCreate(table: string, data: unknown): Promise<any> {
+    return this.dbWrite(() => this.ctx.database.create(table as never, data as never))
+  }
+
+  private dbSet(table: string, query: unknown, data: unknown): Promise<any> {
+    return this.dbWrite(() => this.ctx.database.set(table as never, query as never, data as never))
+  }
+
+  private dbRemove(table: string, query: unknown): Promise<any> {
+    return this.dbWrite(() => this.ctx.database.remove(table as never, query as never))
+  }
+
+  /**
+   * SQLite/sql.js may fail physical DELETE when its backing file is locked.
+   * Fall back to redaction so an administrative purge still completes and the
+   * removed content is no longer exposed to prompts or management commands.
+   */
+  private async purgeTable(table: string, query: unknown, fallback: unknown) {
+    try {
+      await this.dbRemove(table, query)
+    } catch (error) {
+      this.serviceLogger.warn('SQLite 物理删除失败，改用逻辑删除 表=%s 错误=%s', table, error)
+      await this.dbSet(table, query, fallback)
+    }
+  }
 }
 
 function storyIdForCharacter(platform: string, selfId: string) { return `character:${platform}:${selfId}` }
@@ -1374,6 +1929,12 @@ function isOneBotPlatform(platform: string | undefined) {
     || value.startsWith('qq:onebot:')
 }
 
+/** Treat OneBot transport aliases as one administrator-facing platform family. */
+function samePlatformFamily(left: string | undefined, right: string | undefined) {
+  if (isOneBotPlatform(left) && isOneBotPlatform(right)) return true
+  return String(left ?? '').trim().toLowerCase() === String(right ?? '').trim().toLowerCase()
+}
+
 /** Normalize transport-qualified QQ ids such as private:123 or onebot:123. */
 function normalizeAccountId(value: unknown) {
   let normalized = String(value ?? '').trim().toLowerCase()
@@ -1391,6 +1952,11 @@ function phaseLabel(phase: NarrativeRequest['phase']) {
     advance: '自动推进',
     'intent-due': '到期意图',
   } as Record<NarrativeRequest['phase'], string>)[phase] ?? phase
+}
+
+function isTransientDatabaseError(error: unknown) {
+  const message = error instanceof Error ? error.message : String(error)
+  return /disk\s*i\/o|database is locked|busy|unable to open/i.test(message)
 }
 
 function isEnabledAccount(accounts: OneBotAccountRule[] | undefined, qq: string) {
@@ -1631,6 +2197,14 @@ function createFactQuery(participant: InterludeParticipant | null, userMessage: 
     ...dueIntents.map(intent => `Due intent: ${intent.summary}`),
     ...supersededIntents.map(intent => `Superseded plan: ${intent.summary}`),
   ].filter(Boolean).join('\n')
+}
+
+function formatBufferedUserMessages(messages: BufferedUserMessage[]) {
+  if (messages.length === 1) return messages[0].content
+  return messages.map((message, index) => {
+    const time = message.occurredAt.toISOString()
+    return `[连续消息 ${index + 1}，收到时间 ${time}]\n${message.content}`
+  }).join('\n\n')
 }
 
 function automaticIntervalMinutes(story: InterludeStory, now: Date, config: AutoAdvanceConfig) {

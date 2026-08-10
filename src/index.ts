@@ -48,6 +48,7 @@ const Failover: Schema<FailoverConfig> = Schema.object({
 })
 
 const Embedding: Schema<EmbeddingConfig> = Schema.object({
+  liveQuery: Schema.boolean().default(false).description('是否在每次实时对话中额外请求 Embedding 做语义检索。关闭可减少一次网络请求、降低回复延迟；后台向量补齐不受影响。'),
   enabled: Schema.boolean().default(false).description('启用长期事实的语义检索。关闭时退化为规则排序。'),
   providerId: Schema.string().default('').description('生成向量所使用的服务商 id；留空时自动选择。'),
   endpoint: Schema.string().default('').description('Embedding 接口地址；留空时根据聊天接口推导。'),
@@ -93,6 +94,15 @@ const RestWindowSchema: Schema<RestWindow> = Schema.object({
 })
 
 const Runtime: Schema<RuntimeConfig> = Schema.object({
+  splitReplyMessages: Schema.boolean().default(true).description('是否将主模型回复中的 <sep/> 拆成多条 QQ 消息。'),
+  messageSeparator: Schema.string().default('<sep/>').description('分段消息标记。通常保持 <sep/>；模型会在需要多条气泡时输出它。'),
+  typingBaseDelaySeconds: Schema.number().min(0).max(60).default(1).description('发送第二条及后续分段消息前的基础打字等待秒数。'),
+  typingCharactersPerSecond: Schema.number().min(1).max(100).default(8).description('模拟打字速度，每秒字符数；数值越小，长消息等待越久。'),
+  typingMaxDelaySeconds: Schema.number().min(0).max(120).default(12).description('单条后续分段消息的最长打字等待秒数。'),
+  userMessageDebounceSeconds: Schema.number().min(0).max(15).default(2).description('短消息合并等待：每次收到私聊后，等待这段时间再请求主模型；期间的新消息会合并进同一次写作。设为 0 可关闭。'),
+  staleNarrativeRequestWindowSeconds: Schema.number().min(0).max(30).default(5).description('旧请求过期窗口：主模型开始写作后的这段时间内，若同一用户又发消息，旧结果将丢弃，并在新消息等待结束后重新写作。'),
+  narrativeRetryDelaySeconds: Schema.natural().min(5).max(3_600).default(60).description('叙事模型请求失败后，自动再次尝试处理该用户回合前等待的秒数。'),
+  narrativeRetryMaxAttempts: Schema.natural().min(0).max(50).default(6).description('单次用户回合因模型失败可自动重试的最多次数；0 表示关闭。'),
   captureDirectMessages: Schema.boolean().default(true).description('是否拦截并处理私聊文本消息。'),
   autoCreate: Schema.boolean().default(false).description('无主剧本时是否自动创建；关闭后需先执行 interlude.init。'),
   ignoreCommandMessages: Schema.boolean().default(true).description('是否跳过 interlude.* 管理命令，避免进入剧本。'),
@@ -158,8 +168,9 @@ const StoryDefaults: Schema<StoryDefaults> = Schema.object({
 const Logging: Schema<LoggingConfig> = Schema.object({
   level: Schema.union(['silent', 'error', 'warn', 'info', 'debug']).default('info').description('日志阈值；info 显示正常生命周期，debug 追加详细诊断。'),
   format: Schema.union(['compact', 'detailed']).default('detailed').description('compact 为单行摘要；detailed 将故事、阶段和事件拆成多行，便于阅读。'),
-  logScriptPreview: Schema.boolean().default(false).description('是否在日志中写入剧本片段；可能包含私聊内容，生产环境建议关闭。'),
-  previewLength: Schema.natural().min(50).max(4_000).default(500).description('启用剧本预览时的最大字符数。'),
+  logScriptPreview: Schema.boolean().default(false).description('是否输出本轮剧本内容；可能包含私聊信息，生产环境建议关闭。'),
+  logMessageContent: Schema.boolean().default(false).description('是否输出用户消息和主角可见消息内容；涉及隐私，生产环境建议关闭。'),
+  previewLength: Schema.natural().min(50).max(4_000).default(500).description('剧本和消息内容写入日志时的最大字符数。'),
 })
 
 const OneBotBotAccount: Schema<OneBotAccountRule> = Schema.object({
@@ -331,6 +342,130 @@ function registerCommands(ctx: Context, service: InterludeService) {
       const compacted = await service.compactStory(story)
       return compacted ? '已完成一次连续性记忆整理。' : '当前还没有达到需要整理的剧本量。'
     })
+
+  ctx.command('interlude.script [limit:number]', '管理员：查看当前主剧本的最近原始条目，默认 20 条')
+    .action(async ({ session }, limit = 20) => {
+      if (!requireManager(service, session)) return '当前 QQ 没有共享主剧本的管理权限。'
+      const story = await requireStory(service, session)
+      if (typeof story === 'string') return story
+      const entries = await service.recentEntries(story.id, Math.max(1, Math.min(limit, 50)))
+      if (!entries.length) return '当前主剧本还没有原始条目。'
+      return entries.map(entry => `#${entry.id} [${entry.occurredAt.toISOString()}] ${entry.actor}/${entry.kind}${entry.participantId ? `/${entry.participantId}` : ''}\n${entry.content}`).join('\n\n')
+    })
+
+  ctx.command('interlude.script.note <content:text>', '管理员：向剧本写入一条人工注记，不伪装成模型输出')
+    .action(async ({ session }, content) => {
+      if (!requireManager(service, session)) return '当前 QQ 没有共享主剧本的管理权限。'
+      const story = await requireStory(service, session)
+      if (typeof story === 'string') return story
+      return await service.addAdminScriptNote(story, content) ? '已写入管理员注记，后续压缩会将其纳入连续性。' : '注记为空，未写入。'
+    })
+
+  ctx.command('interlude.memory.facts [limit:number]', '管理员：列出长期事实及其编号，默认 20 条')
+    .action(async ({ session }, limit = 20) => {
+      if (!requireManager(service, session)) return '当前 QQ 没有共享主剧本的管理权限。'
+      const story = await requireStory(service, session)
+      if (typeof story === 'string') return story
+      const facts = await service.adminFacts(story.id, limit)
+      if (!facts.length) return '当前没有有效的长期事实。'
+      return facts.map(fact => `#${fact.id} [${fact.scope}] 重要度=${fact.importance.toFixed(2)} 置信度=${fact.confidence.toFixed(2)} 未解决=${fact.unresolved}\n${fact.content}`).join('\n\n')
+    })
+
+  ctx.command('interlude.memory.add <scope:string> <content:text>', '管理员：手动添加长期事实；scope 为 character/world/relationship/event/promise')
+    .action(async ({ session }, scope, content) => {
+      if (!requireManager(service, session)) return '当前 QQ 没有共享主剧本的管理权限。'
+      if (!isFactScope(scope)) return 'scope 必须是 character、world、relationship、event 或 promise。'
+      const story = await requireStory(service, session)
+      if (typeof story === 'string') return story
+      return await service.addAdminFact(story, scope, content) ? '已添加高置信度长期事实。' : '事实内容为空，未添加。'
+    })
+
+  ctx.command('interlude.memory.forget <id:number>', '管理员：将指定长期事实标记为已失效，可审计且不会物理删除')
+    .action(async ({ session }, id) => {
+      if (!requireManager(service, session)) return '当前 QQ 没有共享主剧本的管理权限。'
+      const story = await requireStory(service, session)
+      if (typeof story === 'string') return story
+      return await service.forgetAdminFact(story.id, id) ? `长期事实 #${id} 已标记为失效。` : `未找到有效的长期事实 #${id}。`
+    })
+
+  ctx.command('interlude.memory.intents [limit:number]', '管理员：查看等待中的延迟回复和后续联系计划')
+    .action(async ({ session }, limit = 20) => {
+      if (!requireManager(service, session)) return '当前 QQ 没有共享主剧本的管理权限。'
+      const story = await requireStory(service, session)
+      if (typeof story === 'string') return story
+      const intents = await service.adminPendingIntents(story.id, limit)
+      if (!intents.length) return '当前没有等待中的意图或延迟消息。'
+      return intents.map(intent => `#${intent.id} [${intent.type}] 参与者=${intent.participantId || '全局'} 最早执行=${intent.notBefore.toISOString()}\n${intent.summary}`).join('\n\n')
+    })
+
+  ctx.command('interlude.memory.cancel <id:number>', '管理员：取消指定的等待中意图或延迟消息')
+    .action(async ({ session }, id) => {
+      if (!requireManager(service, session)) return '当前 QQ 没有共享主剧本的管理权限。'
+      const story = await requireStory(service, session)
+      if (typeof story === 'string') return story
+      return await service.cancelAdminIntent(story.id, id) ? `意图 #${id} 已取消。` : `未找到等待中的意图 #${id}。`
+    })
+
+  ctx.command('interlude.memory.patches [limit:number]', '管理员：查看人物、关系和世界设定的演化提案')
+    .action(async ({ session }, limit = 20) => {
+      if (!requireManager(service, session)) return '当前 QQ 没有共享主剧本的管理权限。'
+      const story = await requireStory(service, session)
+      if (typeof story === 'string') return story
+      const patches = await service.adminStatePatches(story.id, limit)
+      if (!patches.length) return '当前没有设定演化提案。'
+      return patches.map(patch => `#${patch.id} [${patch.status}/${patch.target}/${patch.impact}] 置信度=${patch.confidence.toFixed(2)}\n提案：${patch.proposedValue}\n证据：${patch.evidence}`).join('\n\n')
+    })
+
+  ctx.command('interlude.memory.reject <id:number>', '管理员：拒绝一条尚未应用的设定演化提案')
+    .action(async ({ session }, id) => {
+      if (!requireManager(service, session)) return '当前 QQ 没有共享主剧本的管理权限。'
+      const story = await requireStory(service, session)
+      if (typeof story === 'string') return story
+      return await service.rejectAdminStatePatch(story.id, id) ? `设定演化提案 #${id} 已拒绝。` : `未找到待审核的设定演化提案 #${id}。`
+    })
+
+  ctx.command('interlude.database.clear <confirmation:text>', '管理员：清空 HDSI 自有 SQLite 数据表；不会删除 Koishi 用户和其它插件数据')
+    .action(async ({ session }, confirmation) => {
+      if (!requireManager(service, session)) return '无权限：当前账号不是 HDSI 管理员。'
+      if (confirmation !== '确认清空HDSI数据库') return '为防止误删，请完整输入：确认清空HDSI数据库'
+      const result = await service.clearDatabase()
+      return `HDSI 数据库清空完成：处理 ${result.removed} 条记录${result.logicallyCleared ? `，其中 ${result.logicallyCleared} 条因 SQLite 锁定改为逻辑清空` : ''}。`
+    })
+
+  ctx.command('interlude.purge.all <confirmation:text>', '管理员：彻底重置所有平台的剧本、记忆与 Canon；需要确认口令')
+    .action(async ({ session }, confirmation) => {
+      if (!requireManager(service, session)) return '当前 QQ 没有共享主剧本的管理权限。'
+      if (confirmation !== '确认删除全部剧本和记忆') return '为防止误删，请完整输入：确认删除全部剧本和记忆'
+      const story = await requireStory(service, session)
+      if (typeof story === 'string') return story
+      await service.purgeAllData(story.id)
+      return '已彻底重置所有平台：旧剧本、场景摘要、剧情弧线、长期事实、记忆、意图、状态演化和参与者关系状态均已清除；当前故事保留为空白的全局主剧本，Canon 已按当前 Console 配置重建。'
+    })
+
+  ctx.command('interlude.purge.platform <platform:string> <confirmation:text>', '管理员：删除指定平台的全部剧本和记忆；例如 sandbox 或 onebot')
+    .action(async ({ session }, platform, confirmation) => {
+      if (!requireManager(service, session)) return '当前 QQ 没有共享主剧本的管理权限。'
+      if (confirmation !== '确认删除平台剧本和记忆') return '为防止误删，请完整输入：确认删除平台剧本和记忆'
+      const normalized = String(platform ?? '').trim().toLowerCase()
+      if (!normalized) return '请填写平台名，例如 sandbox 或 onebot。'
+      const count = await service.purgePlatformData(normalized)
+      return count
+        ? `已清空并归档平台 ${normalized} 的 ${count} 部剧本；其它平台不受影响。`
+        : `没有找到平台 ${normalized} 的 HDSI 剧本。`
+    })
+
+  ctx.command('interlude.purge.range <from:text> <to:text> <confirmation:text>', '管理员：删除时间范围内的剧本和关联记忆；时间使用 ISO-8601')
+    .action(async ({ session }, fromText, toText, confirmation) => {
+      if (!requireManager(service, session)) return '当前 QQ 没有共享主剧本的管理权限。'
+      if (confirmation !== '确认删除时间段剧本和记忆') return '为防止误删，请完整输入：确认删除时间段剧本和记忆'
+      const from = new Date(fromText)
+      const to = new Date(toText)
+      if (!Number.isFinite(from.getTime()) || !Number.isFinite(to.getTime()) || from > to) return '时间范围无效，请使用 ISO-8601，例如 2026-08-01T00:00:00+08:00。'
+      const story = await requireStory(service, session)
+      if (typeof story === 'string') return story
+      await service.purgeStoryRange(story.id, from, to)
+      return `已删除 ${from.toISOString()} 至 ${to.toISOString()} 范围内的剧本和关联记忆；Canon 与参与者身份未删除。`
+    })
 }
 
 async function requireStory(service: InterludeService, session: Session) {
@@ -347,6 +482,10 @@ async function changeStatus(service: InterludeService, session: Session, status:
 }
 
 function requireManager(service: InterludeService, session: Session) { return service.canManageSession(session) }
+
+function isFactScope(value: string): value is 'character' | 'world' | 'relationship' | 'event' | 'promise' {
+  return ['character', 'world', 'relationship', 'event', 'promise'].includes(value)
+}
 
 function looksLikeInterludeCommand(content: string) { return /^[!/.]?interlude(?:\s|$)/i.test(content.trim()) }
 

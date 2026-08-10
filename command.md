@@ -9,7 +9,7 @@
 - 配置为空：所有已通过 `onebot.userAccounts` 白名单检查的账号都可以执行管理指令。
 - 配置不为空：只有列表中的 QQ 号可以执行管理员指令。
 - 未通过白名单检查的账号不能创建故事、读取上下文或执行管理指令。
-- 管理指令不会写入剧本。建议保持 `runtime.ignoreCommandMessages=true`。
+- 查询指令不会写入剧本；`interlude.script.note`、`interlude.memory.add` 等人工修正指令会留下可审计记录。建议保持 `runtime.ignoreCommandMessages=true`。
 
 机器人账号和用户账号必须分别配置：
 
@@ -44,6 +44,19 @@ sharedStory:
 | `interlude.memory [条数]` | 白名单用户 | 查看长期事实记忆 |
 | `interlude.context` | 白名单用户 | 查看当前场景、剧情弧线、关系状态和召回事实 |
 | `interlude.compact` | 管理员 | 立即执行一次记忆压缩 |
+| `interlude.script [条数]` | 管理员 | 查看跨参与者的原始剧本条目 |
+| `interlude.script.note <内容>` | 管理员 | 写入带来源标记的人工剧本注记 |
+| `interlude.memory.facts [条数]` | 管理员 | 列出长期事实及其编号 |
+| `interlude.memory.add <范围> <内容>` | 管理员 | 人工添加高置信度长期事实 |
+| `interlude.memory.forget <编号>` | 管理员 | 将长期事实标记为失效，不物理删除 |
+| `interlude.memory.intents [条数]` | 管理员 | 查看延迟回复和后续联系计划 |
+| `interlude.memory.cancel <编号>` | 管理员 | 取消一条等待中的意图 |
+| `interlude.memory.patches [条数]` | 管理员 | 查看人物、关系和世界设定的演化提案 |
+| `interlude.memory.reject <编号>` | 管理员 | 拒绝尚未应用的演化提案 |
+| `interlude.database.clear <确认口令>` | 管理员 | 清空 HDSI 自有 SQLite 表；不会删除 Koishi 或其它插件数据 |
+| `interlude.purge.all <确认口令>` | 管理员 | 彻底重置所有平台的剧本、记忆与 Canon，只保留一部空白主剧本 |
+| `interlude.purge.platform <平台> <确认口令>` | 管理员 | 清空并归档指定平台的所有故事，例如 sandbox 或 onebot |
+| `interlude.purge.range <开始> <结束> <确认口令>` | 管理员 | 删除时间范围内的剧本与关联记忆 |
 
 ## 详细用法
 
@@ -160,6 +173,126 @@ interlude.compact
 
 压缩模型会整理已完成场景、长期事实和状态变化提案。若当前剧本尚未达到整理阈值，指令会返回“当前还没有达到需要整理的剧本量”。压缩失败不会回滚主剧本，也不会阻塞正常聊天。
 
+## 剧本人工管理
+
+### `interlude.script [条数]`
+
+查看整个共享主剧本的原始条目，默认 20 条，最多 50 条。与 `interlude.timeline` 不同，它不会按当前参与者过滤，因此仅管理员可用。
+
+```text
+interlude.script 30
+```
+
+每条记录包含数据库编号、发生时间、行为主体、条目类型、参与者标识和正文。编号可用于审计，但当前版本不提供物理删除原始条目的命令，避免误删无法恢复的历史。
+
+### `interlude.script.note <内容>`
+
+向剧本追加人工事实或导演注记。系统会将它标记为 `admin-note` 和“管理员注记”，不会伪装为主模型或用户说过的话；后续压缩会读到这条记录。
+
+```text
+interlude.script.note 主角今晚临时换班，直到凌晨前都在花店。
+```
+
+适合补充刚刚发生但模型未写到的事件。若修改的是长期稳定事实，优先使用 `interlude.memory.add`。
+
+## 长期记忆管理
+
+### `interlude.memory.facts [条数]`
+
+列出当前有效的长期事实。每条都有 `#编号`、范围、重要度、置信度和未解决标志。
+
+```text
+interlude.memory.facts 30
+```
+
+### `interlude.memory.add <范围> <内容>`
+
+人工写入一条高置信度（`1.0`）长期事实。允许的范围为：
+
+- `character`：主角稳定事实
+- `world`：世界或环境事实
+- `relationship`：关系事实
+- `event`：长期影响事件
+- `promise`：承诺、约定或待办
+
+```text
+interlude.memory.add promise 主角答应在周三晚些时候告诉小林面试结果。
+```
+
+### `interlude.memory.forget <编号>`
+
+将事实标记为 `superseded`，使其不再进入主模型上下文，但保留数据库记录以供审计。先用 `interlude.memory.facts` 获取编号。
+
+```text
+interlude.memory.forget 42
+```
+
+### `interlude.memory.intents [条数]` / `interlude.memory.cancel <编号>`
+
+查看或取消等待中的延迟回复、主动联系和后续计划。取消操作只影响尚未执行的意图，不会撤回已经发送的消息。
+
+```text
+interlude.memory.intents 20
+interlude.memory.cancel 15
+```
+
+### `interlude.memory.patches [条数]` / `interlude.memory.reject <编号>`
+
+查看压缩器对人物、关系和世界状态提出的演化提案。已应用、待审核和被拒绝的提案都会显示状态；`reject` 只接受 `proposed` 状态的提案。
+
+```text
+interlude.memory.patches 20
+interlude.memory.reject 8
+```
+
+## 删除剧本和记忆
+
+以下指令是不可逆的数据清理操作，仅允许管理员使用，并且要求完整确认口令。系统会先尝试物理删除；如果 SQLite 文件被占用导致删除失败，会自动改用逻辑删除并清空正文，保证内容不再进入剧本上下文。执行前请先用 `interlude.script`、`interlude.memory.facts` 和 `interlude.context` 导出或截图需要保留的内容。
+
+### `interlude.database.clear <确认口令>`
+
+清空插件自己的 SQLite 数据表（剧本、参与者、记忆、事实、意图、场景、剧情弧线和状态提案）。不会删除 Koishi 用户、频道或其它插件的数据。确认口令固定为：`确认清空HDSI数据库`。
+
+```text
+interlude.database.clear 确认清空HDSI数据库
+```
+
+### `interlude.purge.all <确认口令>`
+
+删除所有平台的剧本与派生数据，并仅保留当前故事作为空白的全局主剧本：
+
+- 原始剧本条目
+- 场景摘要和剧情弧线
+- 长期事实与普通记忆
+- 等待中的意图/延迟回复计划
+- 状态演化提案
+
+会按当前 Console 的 `storyDefaults` 重建主角、世界、文风与默认关系；白名单行中的用户资料和关系也会重新写入参与者档案，并清空关系演化、未读数和待回复数。白名单账号与数据库表结构不会删除。执行后会创建新的空白活动场景和剧情弧线。
+
+```text
+interlude.purge.all 确认删除全部剧本和记忆
+```
+
+### `interlude.purge.platform <平台> <确认口令>`
+
+只清理并归档某一个平台的所有 HDSI 故事，不影响其它平台。常用平台名为 `sandbox` 和 `onebot`；OneBot 的传输别名会一并匹配。确认口令固定为：`确认删除平台剧本和记忆`。
+
+```text
+interlude.purge.platform sandbox 确认删除平台剧本和记忆
+```
+
+### `interlude.purge.range <开始> <结束> <确认口令>`
+
+删除指定时间范围内的原始剧本，并删除创建时间、更新时间或来源条目落在该范围内的关联记忆、事实、意图和状态提案。与时间范围重叠的场景摘要也会删除；未重叠的历史数据保留。
+
+时间必须使用可解析的 ISO-8601 格式，建议明确写出时区：
+
+```text
+interlude.purge.range 2026-08-01T00:00:00+08:00 2026-08-02T00:00:00+08:00 确认删除时间段剧本和记忆
+```
+
+范围删除不会回退故事的真实时间游标，因此后续剧情不会被重新预写；它只清理指定时间段的持久化记录。SQLite 无法物理删除时，会对匹配记录执行逻辑删除和正文清空。
+
 ## 推荐的管理员操作顺序
 
 1. 在 Console 中配置 `model.providers`、`storyDefaults` 和 OneBot 白名单。
@@ -168,8 +301,9 @@ interlude.compact
 4. 使用 `interlude.setup` 补充或修正 Canon。
 5. 用 `interlude.status` 确认故事状态和模型模式。
 6. 用普通私聊测试主模型写作、沉默、延迟回复和多账号关系。
-7. 用 `interlude.timeline`、`interlude.memory`、`interlude.context` 检查连续性。
-8. 需要立即测试自动生活或记忆系统时，分别使用 `interlude.advance` 和 `interlude.compact`。
+7. 用 `interlude.script`、`interlude.memory.facts`、`interlude.memory.intents` 和 `interlude.memory.patches` 审计当前状态。
+8. 需要人工修正时，优先写 `interlude.script.note` 或 `interlude.memory.add`；错误事实用 `interlude.memory.forget` 标记失效。
+9. 需要立即测试自动生活或记忆系统时，分别使用 `interlude.advance` 和 `interlude.compact`。
 
 ## 故障排查
 
@@ -181,4 +315,3 @@ interlude.compact
 | `interlude.advance` 没有消息 | 这表示模型补写了生活但没有判断出当前应发送可见消息，并非执行失败。 |
 | `interlude.compact` 没有整理内容 | 当前未压缩条目或字符数未达到 `memory.sceneEntryThreshold` / `sceneCharacterThreshold`。 |
 | 日志中看不到正常运行信息 | 将 `logging.level` 设为 `info`；排查 API 时临时使用 `debug`，完成后恢复。 |
-
