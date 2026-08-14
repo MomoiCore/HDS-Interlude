@@ -1,4 +1,11 @@
 # HDS Interlude 管理员指令
+## 使用前先看这里
+
+- 新手安装和首次测试：`BEGINNER_GUIDE.md`
+- 配置项解释：`CONFIGURATION_GUIDE.md`
+- 本文件只保留管理员和剧本/记忆管理指令。
+
+
 
 本文档说明 HDS Interlude 当前提供的 Koishi 指令。指令默认只在私聊中使用，并且会经过 OneBot/NapCat 白名单检查。
 
@@ -49,14 +56,15 @@ sharedStory:
 | `interlude.memory.facts [条数]` | 管理员 | 列出长期事实及其编号 |
 | `interlude.memory.add <范围> <内容>` | 管理员 | 人工添加高置信度长期事实 |
 | `interlude.memory.forget <编号>` | 管理员 | 将长期事实标记为失效，不物理删除 |
-| `interlude.memory.intents [条数]` | 管理员 | 查看延迟回复和后续联系计划 |
+| `interlude.memory.intents [条数]` | 管理员 | 查看延迟回复、提醒、承诺和剧情余波 |
 | `interlude.memory.cancel <编号>` | 管理员 | 取消一条等待中的意图 |
 | `interlude.memory.patches [条数]` | 管理员 | 查看人物、关系和世界设定的演化提案 |
 | `interlude.memory.reject <编号>` | 管理员 | 拒绝尚未应用的演化提案 |
-| `interlude.database.clear <确认口令>` | 管理员 | 清空 HDSI 自有 SQLite 表；不会删除 Koishi 或其它插件数据 |
-| `interlude.purge.all <确认口令>` | 管理员 | 彻底重置所有平台的剧本、记忆与 Canon，只保留一部空白主剧本 |
-| `interlude.purge.platform <平台> <确认口令>` | 管理员 | 清空并归档指定平台的所有故事，例如 sandbox 或 onebot |
-| `interlude.purge.range <开始> <结束> <确认口令>` | 管理员 | 删除时间范围内的剧本与关联记忆 |
+| `interlude.overlay.clear <部分>` | 管理员 | 询问 y/n 后，只清理 character、relationship、world 或 all 对应的设定 overlay |
+| `interlude.database.clear` | 管理员 | 询问 y/n 后清空 HDSI 自有 SQLite 表；不会删除 Koishi 或其它插件数据 |
+| `interlude.purge.all` | 管理员 | 询问 y/n 后彻底重置所有平台的剧本、记忆与 Canon，只保留一部空白主剧本 |
+| `interlude.purge.platform <平台>` | 管理员 | 询问 y/n 后清空并归档指定平台的所有故事，例如 sandbox 或 onebot |
+| `interlude.purge.range <开始> <结束>` | 管理员 | 询问 y/n 后删除时间范围内的剧本与关联记忆 |
 
 ## 详细用法
 
@@ -68,7 +76,7 @@ sharedStory:
 interlude.init 林知遥
 ```
 
-如果当前机器人账号已经存在共享主剧本，指令不会创建第二个剧本，而是把当前用户作为新的参与者加入。
+如果当前机器人账号已经存在共享主剧本，当前用户会作为新的参与者加入该主剧本。
 
 ### `interlude.status`
 
@@ -229,7 +237,7 @@ interlude.memory.forget 42
 
 ### `interlude.memory.intents [条数]` / `interlude.memory.cancel <编号>`
 
-查看或取消等待中的延迟回复、主动联系和后续计划。取消操作只影响尚未执行的意图，不会撤回已经发送的消息。
+查看或取消等待中的延迟回复、主动联系、提醒、承诺和剧情余波。取消操作只影响尚未执行的意图，不会撤回已经发送的消息。
 
 ```text
 interlude.memory.intents 20
@@ -245,19 +253,37 @@ interlude.memory.patches 20
 interlude.memory.reject 8
 ```
 
-## 删除剧本和记忆
+### `interlude.overlay.clear <部分>`
 
-以下指令是不可逆的数据清理操作，仅允许管理员使用，并且要求完整确认口令。系统会先尝试物理删除；如果 SQLite 文件被占用导致删除失败，会自动改用逻辑删除并清空正文，保证内容不再进入剧本上下文。执行前请先用 `interlude.script`、`interlude.memory.facts` 和 `interlude.context` 导出或截图需要保留的内容。
+只清理剧情累计形成的设定 overlay，不删除 Canon、剧本、长期事实、普通记忆或等待中的意图。适合在 Console 中大幅修改某一项初始设定后使用。
 
-### `interlude.database.clear <确认口令>`
+- `character`：清理主角性格、人物资料和特征的演化 overlay。
+- `relationship`：清理全局关系 overlay，以及所有参与者各自的关系 overlay。
+- `world`：清理世界状态的演化 overlay。
+- `all`：清理以上全部 overlay，但仍保留剧本和记忆。
 
-清空插件自己的 SQLite 数据表（剧本、参与者、记忆、事实、意图、场景、剧情弧线和状态提案）。不会删除 Koishi 用户、频道或其它插件的数据。确认口令固定为：`确认清空HDSI数据库`。
+执行后插件会询问“确认执行吗？(y/n)”，请回复 `y` 才会继续；回复 `n` 或 60 秒内没有回复都会取消。已经应用的对应状态提案会标为 `cleared`，保留审计记录。
 
 ```text
-interlude.database.clear 确认清空HDSI数据库
+interlude.overlay.clear character
+interlude.overlay.clear relationship
+interlude.overlay.clear world
+interlude.overlay.clear all
 ```
 
-### `interlude.purge.all <确认口令>`
+## 删除剧本和记忆
+
+以下指令是不可逆的数据清理操作，仅允许管理员使用。执行后插件会询问 y/n，只有回复 `y` 才会继续；回复 `n` 或 60 秒内没有回复都会取消。系统会先尝试物理删除；如果 SQLite 文件被占用导致删除失败，会自动改用逻辑删除并清空正文，保证内容不再进入剧本上下文。执行前请先用 `interlude.script`、`interlude.memory.facts` 和 `interlude.context` 导出或截图需要保留的内容。
+
+### `interlude.database.clear`
+
+清空插件自己的 SQLite 数据表（剧本、参与者、记忆、事实、意图、场景、剧情弧线和状态提案）。不会删除 Koishi 用户、频道或其它插件的数据。执行命令后按提示回复 `y`。
+
+```text
+interlude.database.clear
+```
+
+### `interlude.purge.all`
 
 删除所有平台的剧本与派生数据，并仅保留当前故事作为空白的全局主剧本：
 
@@ -270,25 +296,25 @@ interlude.database.clear 确认清空HDSI数据库
 会按当前 Console 的 `storyDefaults` 重建主角、世界、文风与默认关系；白名单行中的用户资料和关系也会重新写入参与者档案，并清空关系演化、未读数和待回复数。白名单账号与数据库表结构不会删除。执行后会创建新的空白活动场景和剧情弧线。
 
 ```text
-interlude.purge.all 确认删除全部剧本和记忆
+interlude.purge.all
 ```
 
-### `interlude.purge.platform <平台> <确认口令>`
+### `interlude.purge.platform <平台>`
 
-只清理并归档某一个平台的所有 HDSI 故事，不影响其它平台。常用平台名为 `sandbox` 和 `onebot`；OneBot 的传输别名会一并匹配。确认口令固定为：`确认删除平台剧本和记忆`。
+只清理并归档某一个平台的所有 HDSI 故事，不影响其它平台。常用平台名为 `sandbox` 和 `onebot`；OneBot 的传输别名会一并匹配。执行命令后按提示回复 `y`。
 
 ```text
-interlude.purge.platform sandbox 确认删除平台剧本和记忆
+interlude.purge.platform sandbox
 ```
 
-### `interlude.purge.range <开始> <结束> <确认口令>`
+### `interlude.purge.range <开始> <结束>`
 
 删除指定时间范围内的原始剧本，并删除创建时间、更新时间或来源条目落在该范围内的关联记忆、事实、意图和状态提案。与时间范围重叠的场景摘要也会删除；未重叠的历史数据保留。
 
 时间必须使用可解析的 ISO-8601 格式，建议明确写出时区：
 
 ```text
-interlude.purge.range 2026-08-01T00:00:00+08:00 2026-08-02T00:00:00+08:00 确认删除时间段剧本和记忆
+interlude.purge.range 2026-08-01T00:00:00+08:00 2026-08-02T00:00:00+08:00
 ```
 
 范围删除不会回退故事的真实时间游标，因此后续剧情不会被重新预写；它只清理指定时间段的持久化记录。SQLite 无法物理删除时，会对匹配记录执行逻辑删除和正文清空。
@@ -312,6 +338,6 @@ interlude.purge.range 2026-08-01T00:00:00+08:00 2026-08-02T00:00:00+08:00 确认
 | 提示没有管理权限 | 当前 QQ 是否在 `onebot.userAccounts`，以及是否在 `sharedStory.managerAccounts`。 |
 | 提示没有故事 | 先执行 `interlude.init`，或开启 `runtime.autoCreate`。 |
 | 指令被角色当作聊天 | 将 `runtime.ignoreCommandMessages` 设置为 `true`。 |
-| `interlude.advance` 没有消息 | 这表示模型补写了生活但没有判断出当前应发送可见消息，并非执行失败。 |
+| `interlude.advance` 没有消息 | 模型完成了剧本补写，但当前没有生成可投递消息。 |
 | `interlude.compact` 没有整理内容 | 当前未压缩条目或字符数未达到 `memory.sceneEntryThreshold` / `sceneCharacterThreshold`。 |
-| 日志中看不到正常运行信息 | 将 `logging.level` 设为 `info`；排查 API 时临时使用 `debug`，完成后恢复。 |
+| 日志中看不到正常运行信息 | 将 `logging.level` 设为 `info`，并将 `logging.verbosity` 设为 `standard`；排查时序或跳过原因时临时使用 `diagnostic`，完成后恢复。 |

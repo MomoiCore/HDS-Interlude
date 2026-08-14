@@ -1,7 +1,7 @@
 import { Context } from 'koishi'
 import {
   InterludeArc, InterludeParticipant, InterludeScene, InterludeStory, NarrativeFact, NarrativeIntent,
-  NarrativeMemory, ScriptEntry, StatePatchProposal,
+  NarrativeMemory, ScriptEntry, StatePatchProposal, WebObservation,
 } from './types'
 
 declare module 'koishi' {
@@ -15,6 +15,7 @@ declare module 'koishi' {
     interlude_arc: InterludeArc
     interlude_fact: NarrativeFact
     interlude_state_patch: StatePatchProposal
+    interlude_web_observation: WebObservation
   }
 }
 
@@ -22,7 +23,14 @@ export function registerTables(ctx: Context) {
   // Koishi keeps the model registry on the parent context during plugin
   // reloads. Re-registering the same eight schemas forces minato to rebuild
   // indexes and is a noticeable source of reload latency.
-  if ((ctx.model as any).tables?.interlude_story) return
+  const existingTables = (ctx.model as any).tables ?? {}
+  // Existing installations already have the original tables registered by a
+  // parent context. Do not rebuild those schemas on reload, but keep adding
+  // genuinely new tables introduced by later releases.
+  if (existingTables.interlude_story) {
+    if (!existingTables.interlude_web_observation) registerWebObservationTable(ctx)
+    return
+  }
 
   // 故事表保存可追溯的 canon 与可变的当前状态；原始剧本文本不内嵌在这里。
   ctx.model.extend('interlude_story', {
@@ -85,4 +93,17 @@ export function registerTables(ctx: Context) {
     proposedValue: 'text', evidence: 'text', confidence: 'double', impact: 'string(16)',
     status: 'string(16)', sourceEntryIds: 'json', createdAt: 'timestamp', appliedAt: 'timestamp',
   }, { primary: 'id', autoInc: true, indexes: ['storyId', 'status', 'confidence'] })
+
+  registerWebObservationTable(ctx)
+}
+
+/** Kept separately so an upgrade can register only this new table without
+ * forcing Minato/sql.js to rebuild every long-lived HDSI index on reload. */
+function registerWebObservationTable(ctx: Context) {
+  if ((ctx.model as any).tables?.interlude_web_observation) return
+  ctx.model.extend('interlude_web_observation', {
+    id: 'unsigned', storyId: 'string(255)', participantId: 'string(255)', intentId: 'unsigned',
+    mode: 'string(16)', query: 'text', url: 'text', title: 'text', excerpt: 'text', summary: 'text',
+    status: 'string(16)', accessedAt: 'timestamp', createdAt: 'timestamp',
+  }, { primary: 'id', autoInc: true, indexes: ['storyId', 'status', 'accessedAt'] })
 }

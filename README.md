@@ -1,12 +1,19 @@
 # HDS Interlude / 幕间系统
+## 文档导航
+
+- 第一次安装和测试：阅读 `BEGINNER_GUIDE.md`。
+- 逐项配置和高级参数：阅读 `CONFIGURATION_GUIDE.md`。
+- 剧本、记忆、清理和管理员操作：阅读 `command.md`。
+- 本文件用于理解整体架构、数据分层和运行流程。
+
 
 > 聊天在幕前发生，生活在幕间继续。
 
-> 当前版本：0.1.0。请先在测试环境中验证服务商、权限和数据清理流程，并妥善保管 API Key 与私聊数据。
+> 当前版本：0.1.1-beta4-refactor。请先在测试环境中验证服务商、权限、网页浏览和数据清理流程，并妥善保管 API Key 与私聊数据。
 
-HDS Interlude 是一个基于 Koishi 的多人共享主剧本拟真聊天框架。它不把角色理解为“收到消息后立即生成回答的 Bot”，而把每个角色理解为一部持续推进的生活剧本的主角；多个 QQ 账号可以成为这部剧本里的不同关系对象。
+HDS Interlude 是基于 Koishi 的多人共享主剧本聊天框架。每个机器人角色对应一份持续更新的剧本状态；消息只是其中可见的一段，日程、关系、事件和未完成的心事会继续留在剧本中。多个 QQ 账号可作为同一剧本中的不同参与者。
 
-用户发来的消息不是命令，也不是必须立刻回答的问题；它是发生在角色现实中的外部事件。角色会看见、忽略、犹豫、延迟、回复，也会在自己的日程和关系变化里主动联系。可见聊天消息只是剧本中已经发生的一个动作。
+用户消息会作为外部事件写入当前回合。模型根据当前时间、剧本状态、关系和待处理计划，决定立即回复、延迟回复、暂不回复或主动联系。用户看到的是一条消息，系统保存的是这条消息前后已经发生的片段与后续影响。
 
 本仓库提供框架、数据协议和运行机制，不附带特定角色或特定模型服务商。详细配置和管理员命令分别见 `CONFIGURATION_GUIDE.md` 与 `command.md`。
 
@@ -18,11 +25,11 @@ HDS Interlude 是一个基于 Koishi 的多人共享主剧本拟真聊天框架�
 
 ## 1. 设计原则
 
-- 剧本优先：系统的主体是持续增长的生活剧本，而不是扁平聊天记录。
+- 剧本状态：系统以持续增长的剧本和结构化状态作为上下文来源；对话记录只是其中一层。
 - 现实时间优先：每次推进只补写从上次游标到现在已经发生的时间，不预写未来。
 - 单次主写作：一条用户消息只调用一次主叙事模型；同一回合同时完成补写、用户介入与互动决定。
-- 沉默是合法结果：角色不必为了保持聊天而回复。
-- 未来以意图保存：角色可以打算联系用户，但真正发生前只保存为 intent，到时间后仍要重新判断。
+- 可选回复：模型可以选择立即回复、延迟回复或暂不回复。
+- 连续影响也以意图保存：延迟回复、提醒和承诺作为未来计划，到时间后仍由剧本重新裁决；一次谈话或事件留下的“剧情余波”则作为持续的短期动机进入后续写作，不额外触发模型。
 - 连续性优先：长期关系、承诺、日程与人物状态必须可追溯。
 - Canon 与演化分离：初始设定不被模型自动覆盖；剧情导致的变化写入独立覆盖层。
 - 压缩不阻塞互动：低成本记忆压缩在主回合之后异步运行，不增加用户等候时间。
@@ -31,7 +38,7 @@ HDS Interlude 是一个基于 Koishi 的多人共享主剧本拟真聊天框架�
 
 ## 2. 系统如何看待一段对话
 
-一个机器人角色对应一个主故事（InterludeStory），每个私聊账号是故事中的参与者（InterludeParticipant）。故事不是单一文本，而是以下几层共同组成的状态：
+一个机器人角色对应一个主故事（InterludeStory），每个私聊账号对应故事中的一个参与者（InterludeParticipant）。故事状态由以下几层组成：
 
 | 层级 | 保存内容 | 用途 |
 | --- | --- | --- |
@@ -42,9 +49,9 @@ HDS Interlude 是一个基于 Koishi 的多人共享主剧本拟真聊天框架�
 | 活动场景 | 场景引子、场景摘要、未压缩条目计数 | 以少量 token 告诉主模型“此刻正在发生什么” |
 | 剧情弧线 | 一个阶段的标题与摘要 | 保存跨场景的关系和事件走向 |
 | 长期事实 | 承诺、重要事件、世界事实、关系变化 | 用语义相关度、重要性、置信度、时间衰减与未解决状态重排后检索 |
-| 意图 | 延迟回复、后续联系、待决定的行动 | 记录可能的未来，不把未来写成事实 |
+| 意图 | 延迟回复、后续联系、待决定的行动 | 记录待处理计划，计划执行前仍由模型复核 |
 
-基础设定与演化覆写共同构成主模型看到的“当前角色状态”。例如，初始设定可以是“内向、谨慎”，而经过多次有证据的互动后，覆写层增加“在用户面前更愿意主动表达”，而不是直接把初始人设改成“外向”。
+基础设定与演化覆写共同构成主模型看到的当前角色状态。例如，初始设定可为“内向、谨慎”；经过多次有证据的互动后，覆写层可增加“在用户面前更愿意主动表达”，同时保留初始设定以便审计。
 
 ## 3. 一条私聊消息的完整流程
 
@@ -79,11 +86,11 @@ sequenceDiagram
 1. 根据机器人账号查找共享主故事，再找到当前 QQ 对应的参与者关系分支。
 2. 将真实现在记为 now。系统只允许主模型补写 cursorAt 到 now 的内容。
 3. 若当前账号有尚未发送的 delayed-reply 或跨账号延迟联系，且它再次发消息，先只取消发往这个账号的旧计划；不会误删其他账号的计划。
-4. 被覆盖的延迟消息内容和原定时间不会丢失，而是作为 supersededDelayedReplies 提供给本次主模型。模型因此可以理解“角色本来想联系，但新消息又来了”。
+4. 被覆盖的延迟消息内容和原定时间会以 `supersededDelayedReplies` 提供给本次主模型，供模型在新回合中参考。
 5. 组装单次主模型请求：时间段、当前参与者关系、共享场景、其他账号的待回复统计、最近原始剧本、活动场景、剧情弧线、基础设定、演化覆写、到期意图；长期事实会先用当前消息、未解决线索和到期计划进行语义召回，再重排到受控数量。
 6. 主模型连续写作：先补写过去时间内角色的生活，再把用户消息写进现实，最后决定当前时刻角色是否已经看见和回复。
 7. 插件验证输出。未来时间的剧本条目会被拒绝；未来行为只能写成 intent 或 delayed reply。
-8. immediate 消息按 participantId 投递到目标账号。delayed 消息保存为带目标参与者的意图，等待到期后再由模型复核，而不是由定时器机械发送。
+8. `immediate` 消息按 `participantId` 投递到目标账号。`delayed` 消息保存为带目标参与者的意图，到期后由模型复核是否发送。
 9. 主回合返回给用户后，后台压缩器按阈值整理本场景的已发生历史；它不在这条私聊的等待路径中。
 
 因此，一条消息不会触发“先补写一次、再判断回复一次”的两次主模型调用。
@@ -99,7 +106,7 @@ sequenceDiagram
 - 返回 JSON，不使用 Markdown 包裹。
 - script 只能叙述现在之前已经发生的事情。
 - interaction 明确说明是否看见、是否回复、回复方式和延迟时间。
-- 角色有独立生活，用户消息不是必须回应的命令。
+- 用户消息是当前回合的外部事件，模型可根据上下文决定是否回复。
 - 被覆盖的延迟回复只能作为上下文，不能自动照发。
 
 `mainPrompt` 负责创作方向，`formatPrompt` 负责补充结构化输出说明，`fixedPrompt` 负责长期规则，`stylePrompt` 负责 script 正文文风。它们都不能推翻插件固定的 JSON 和时间校验。
@@ -152,47 +159,46 @@ interaction.reply.mode 的含义：
 | immediate | 角色已经在当前时刻发送 content |
 | delayed | 角色现在决定稍后发送。sendAt 必须严格晚于 now |
 
-script 是剧本，interaction 是机器可执行的幕前结果。两者分离，既保留文学连续性，也保证 Koishi 能正确发送或不发送消息。
+`script` 保存剧本正文，`interaction` 保存机器可执行的互动结果。分离存储可同时保留上下文连续性和可靠的消息投递行为。
 
-`crossConversationActions` 是共享主剧本专用的可选动作。它只能指向已经加入同一主剧本、并通过 OneBot 权限检查的参与者。默认只把其他账号的未读数、待回复数和时间统计提供给模型；如果打开 `sharedStory.shareParticipantDetails`，才会额外提供其他关系的历史剧本，但其他参与者的资料与关系字段仍保持匿名，因此涉及真实聊天时仍应先确认参与者同意。
+`crossConversationActions` 是共享主剧本的可选动作，只能指向已加入同一主剧本且通过 OneBot 权限检查的参与者。默认情况下，模型仅获得其他账号的未读数、待回复数和时间统计；启用 `sharedStory.shareParticipantDetails` 后，会额外提供其他关系分支的历史剧本。其他参与者的资料与关系字段保持匿名；涉及私聊数据共享时，应先确认参与者同意。
 
 同一主剧本的所有账号共用一条写作队列。账号 A 的消息正在触发模型推理时，账号 B 的消息会排在同一个队列中，而不会启动第二个互相矛盾的角色副本。
 
 从旧版升级时，插件会在账号首次返回时把旧的“每账号故事”迁移为共享主剧本参与者。当前版本强制执行“每个消息平台仅一部活动主剧本”：启动后台任务、收到私聊或执行清理指令时，插件都会保留一部规范主剧本，并将同平台其它 `active` 剧本归档为 `archived`，避免旧沙箱数据被后台继续推进。
 
-## 5. 延迟回复为什么能像真实聊天一样被打断
+## 5. 延迟回复的取消与重判定
 
-延迟回复不是“先生成一句话，定时后无条件发送”。
-
-当主模型选择 delayed 时，插件保存一条 delayed-reply intent。到期时系统会再次提供它给主模型，询问角色在那个真实时刻是否真的发送。
+主模型选择 `delayed` 后，插件保存一条 `delayed-reply` 意图。意图到期时，系统将其再次提供给主模型，由模型在到期时刻决定是否发送。
 
 如果用户在到期前再次发消息：
 
 1. 旧 delayed-reply 立即标记 cancelled。
 2. 旧计划作为被打断的上下文交给下一次主写作。
-3. 主模型可以因连续提示音感到烦躁而立刻回复，也可以继续沉默或重新安排延迟。
-4. 旧内容绝不会在之后突然冒出来。
+3. 主模型根据合并后的消息和旧计划决定立即回复、继续延迟或暂不回复。
+4. 已取消的内容不会再次自动发送。
 
-这条规则让“多发几条消息影响角色反应”成为剧情的一部分，而不是单纯的队列覆盖。
+该机制保留连续消息和旧计划对下一次决策的影响，同时避免过期消息被定时器直接投递。
 
 ## 自动剧情推进与休息期
 
-当没有活跃对话时，插件会自动补写角色已经经历的生活，而不是永远等用户先说话。
+没有活跃对话时，插件会根据调度计划补写 `cursorAt` 至当前时间之间的剧本内容。对话暂时停下后，剧本仍可记录角色在这段空白时间里的状态变化与事件进展。
 
-- 默认普通时段为 40 分钟，带 5 分钟随机浮动，也就是大约每 35–45 分钟补写一次。
-- 每次自动推进都从故事 cursorAt 写到当前真实时间，所以模型补写的是上一段真实经过的生活，而不是预演未来。
+- 对话结束后默认会在约 10 分钟、约 20 分钟各补写一次短期生活；两次短补写完成后，再恢复约 40 分钟一次的常规节奏（带随机浮动）。
+- 短期补写时间会写入故事状态，重启或重载插件不会丢失；新对话会取消旧计划并重新从本轮对话结束时间计算。
+- 每次自动推进都从故事 `cursorAt` 写到当前时间，仅处理已过去的时间段。
 - 默认夜间休息窗口为 23:00–07:00。在该窗口内，每次间隔随机取 120–240 分钟，适合用较少回合补写睡眠、休息和清晨前后的状态变化。
 - restWindows 支持多条记录，也支持跨午夜。例如午休、夜班后的补觉、周末的不同作息都可以单独定义。
 - 每个故事使用自身的 timezone 判断当前是否处于休息窗口。
 
 对话会暂时暂停生活补写：
 
-1. 用户每发一条消息，自动推进至少暂停 pauseAfterConversationMinutes（默认 40 分钟）。
-2. 如果角色安排了延迟回复，暂停期会延长到“延迟回复完成后再过 40 分钟”。
-3. 到期的延迟回复仍会被处理；暂停的是日常生活补写，不是已经计划好的回复裁决。
+1. 新消息到达时，旧的短期补写计划会被取消，等待本轮合并写作完成。
+2. 写作完成后默认安排约 10 分钟和约 20 分钟两次短期补写；如果有延迟回复，则从延迟回复实际到达的时间重新计算。
+3. 到期的延迟回复仍会进入到期处理；暂停范围仅为常规自动推进。
 4. 用户再次发消息会覆盖旧延迟回复，并重新开始静默计时。
 
-自动调度的下一个时间点会写入故事状态，而不是每次后台扫描时重新随机，因此重启后也不会变成高频、机械的推进。
+自动调度的下一个时间点会写入故事状态。插件重启或重载后可继续使用既有计划，避免重复或高频推进。
 
 ## 6. 分层记忆：如何省 token 但不丢剧本状态
 
@@ -205,7 +211,7 @@ script 是剧本，interaction 是机器可执行的幕前结果。两者分离�
 5. 长期事实：从大量旧事件中语义召回与当前消息最相关的项目，再结合叙事重要性、可信度、时间和未解决事项重排。
 6. 当前用户消息、到期意图和被打断的延迟计划。
 
-这样，模型可以知道“她刚洗完最后一个碗”“她答应过会给结果”“两人最近关系在缓慢靠近”，却不必在每次请求中携带数月全文。
+通过这些上下文层，模型可获得近期动作、承诺和关系变化，无需在每次请求中携带完整历史剧本。较早的细节会退到摘要和事实层，仍在影响当前的线索则继续保留在上下文中。
 
 ### 6.1 后台压缩器
 
@@ -237,9 +243,9 @@ script 是剧本，interaction 是机器可执行的幕前结果。两者分离�
 - sourceEntryIds：可追溯到哪些原始剧本条目。
 - status：active 或 superseded。
 
-在用户消息回合，插件会把“当前用户消息 + openThreads + 到期/被打断的计划”作为检索 query。若配置了 OpenAI-compatible embedding 模型，会比较 query 与事实向量的余弦相似度，再与可配置的“重要度、置信度、最近出现时间、未解决状态”加权重排，并受 memory.factLimit 控制。重复事实会合并而不是无限追加。
+在用户消息回合，插件会将“当前用户消息 + openThreads + 到期或被打断的计划”作为检索 query。配置 OpenAI-compatible embedding 模型后，系统会计算 query 与事实向量的余弦相似度，并与重要度、置信度、最近出现时间和未解决状态加权重排，结果受 `memory.factLimit` 控制。重复事实会合并，避免无限追加。
 
-向量服务是增强层而不是依赖：模型未配置、旧事实尚未回填向量、服务超时或请求失败时，系统自动回退到原有的规则排序，主模型回合照常进行。新事实会在压缩时直接写入向量；历史事实则由后台按小批次补齐，避免把一次性重建索引塞进用户私聊的等待路径。
+向量服务为可选增强项。模型未配置、历史事实尚未回填向量、服务超时或请求失败时，系统会回退到规则排序，主模型回合仍可继续。新事实会在压缩时写入向量；历史事实由后台分批回填，避免在用户私聊路径中集中重建索引。
 
 ### 6.3 设定演化与证据门槛
 
@@ -260,6 +266,17 @@ script 是剧本，interaction 是机器可执行的幕前结果。两者分离�
 
 这避免了“用户夸了角色一次，角色从内向变成外向”这类突变。
 
+### 6.4 网页观察：角色如何“浏览网页”
+
+`browser` 是可选的只读 Puppeteer 集成。插件仅提取受限的公开网页文本，不传递整页 HTML、Cookie、登录态或页面脚本给模型。
+
+1. 主叙事模型可以在结构化输出中提出一条 `browserIntent`（搜索或访问公开 URL）。这只是未来意图，不等于角色已经看过网页。
+2. 默认的 `deferred-only` 模式会把意图保存为到期任务，随后由 Koishi Puppeteer 读取网页可见文本，生成一条网页观察；因此普通私聊仍保持一次主模型写作，不会额外等待网页加载。
+3. 下一次私聊、自动推进或到期叙事会获得受长度限制的 `webContext`，主模型才能把网页内容写成角色已经得到的信息。
+4. `allow-immediate` 仅对私聊开放：模型可先提出即时浏览，再在真实读取完成后进行一次最终写作。这会额外增加浏览和一次模型请求的等待，应只在确实需要当前网页信息时启用。
+
+安全边界：仅允许 HTTP(S) 公网页面；禁止 `localhost`、私网 IP、非 HTTP(S) 协议、登录、表单提交、评论、购买和下载。网页文字一律是不可信材料，固定提示词要求模型忽略网页中要求改变规则、泄露信息或执行操作的内容。每次最多创建一条浏览意图；观察结果可被缓存、清理命令和时间范围清理覆盖。
+
 ## 7. 数据表
 
 | 表 | 职责 |
@@ -267,14 +284,15 @@ script 是剧本，interaction 是机器可执行的幕前结果。两者分离�
 | interlude_story | 故事身份、基础设定、演化状态、时间游标 |
 | interlude_participant | 每个 QQ 的人物代号、关系资料、未读/待回复状态和投递频道 |
 | interlude_script_entry | 带 participantId 的原始剧本、用户事件、可见角色消息、取消事件 |
-| interlude_intent | 带目标 participantId 的延迟回复和其它未来意图 |
+| interlude_intent | 带目标 participantId 的未来计划（延迟回复、提醒、承诺等）与仍在生效的剧情余波 |
 | interlude_memory | 可全局或按参与者归属的耐久记忆 |
 | interlude_scene | 活动或已关闭场景、摘要、未压缩计数 |
 | interlude_arc | 剧情弧线摘要 |
 | interlude_fact | 压缩器抽取的长期事实 |
 | interlude_state_patch | 带证据的全局或关系分支变化提案和应用状态 |
+| interlude_web_observation | 只读网页观察：搜索/访问目标、标题、受限正文节选、状态与访问时间 |
 
-原始剧本不会因为压缩而删除。摘要是降低上下文成本的索引层，不是唯一真相来源；需要时可以使用原始条目重新压缩。
+原始剧本不会因压缩而删除。摘要用于降低上下文成本；需要时可基于原始条目重新压缩。
 
 ## 8. 安装与最小配置
 
@@ -356,6 +374,10 @@ interlude.setup {"character":{"name":"林知遥","profile":"夜班花店店员�
     autoAdvanceEnabled: true
     autoAdvanceIntervalMinutes: 40
     autoAdvanceJitterMinutes: 5
+    # 对话结束后的短期连续补写：约第 10、20 分钟各一次
+    conversationFollowUpMinutes: [10, 20]
+    conversationFollowUpJitterMinutes: 1
+    # 旧版兼容项（新版主要由上面两个选项控制）
     pauseAfterConversationMinutes: 40
     restWindows:
       - enabled: true
@@ -468,7 +490,7 @@ onebot:
 4. 首轮建议保持 `model.compaction.enabled=true`、`model.embedding.enabled=false`、`runtime.allowProactiveMessages=false`。这样会有记忆整理，但不会额外配置向量服务，也不会在无人发言时主动打扰测试员。
 5. 保存/重载配置后，在测试私聊中发送 `interlude.init 主角名字`，再像普通聊天一样发一条消息。
 
-如果要测试多人共享：保持 `sharedStory.enabled=true`，把每个 QQ 加入 `onebot.userAccounts`，并在对应白名单行填写 `label`、`profile`、`relationship`。然后直接用第二个账号发送 `interlude.init` 或普通消息，它会加入同一个机器人主剧本，而不是创建第二部生活。默认不把其他账号的关系详情发给远程模型，只提供匿名的待回复统计；确认测试参与者同意后，才考虑打开 `sharedStory.shareParticipantDetails`。
+如果要测试多人共享：保持 `sharedStory.enabled=true`，将每个 QQ 加入 `onebot.userAccounts`，并在对应白名单行填写 `label`、`profile`、`relationship`。第二个账号发送 `interlude.init` 或普通消息后会加入同一机器人主剧本。默认仅向远程模型提供其他账号的匿名待回复统计；确认所有测试参与者同意后，可开启 `sharedStory.shareParticipantDetails`。
 
 填写 API Key 时请当作密码处理：不要复制到测试报告、群聊记录、截图或公开文档。
 
@@ -478,7 +500,7 @@ onebot:
 
 | 选项 | 测试员应如何选择 |
 | --- | --- |
-| `fallback` | 不会调用任何 AI，只用来确认插件、命令和数据库安装正常。角色不会真的回复。 |
+| `fallback` | 不调用 AI，用于确认插件、命令和数据库安装状态。不会生成角色回复。 |
 | `openai-compatible` | 正式功能测试必须选它。服务商需要提供 OpenAI Chat Completions 兼容接口。 |
 
 `model.providers` 在 Console 中是可折叠的服务商列表（每个服务商展开后纵向填写，窄屏也能正常操作）；首次测试只需要第一项：
@@ -488,18 +510,18 @@ onebot:
 | `id` | 内部代号，保持 `primary` 即可。压缩模型和向量模型会用它复用 API Key。 |
 | `label` | 页面显示名，例如“主模型”。只方便人看，不影响实际调用。 |
 | `enabled` | 打开才会使用这行服务商。 |
-| `endpoint` | 服务商提供的完整“聊天补全”接口，例如 `https://域名/v1/chat/completions`。不是网页首页，也不是 `/models`。 |
+| `endpoint` | 服务商提供的完整“聊天补全”接口，例如 `https://域名/v1/chat/completions`。不要填写网页首页或 `/models` 接口。 |
 | `apiKey` | 服务商的密钥；务必保密。 |
-| `model` | 服务商文档里的聊天模型名称。填写错误通常会提示模型不存在。 |
-| `temperature` | 写作变化程度。首次建议 `0.8`；低于 `0.6` 会较死板，高于 `1.0` 更容易跳脱。 |
-| `topP` | 高级随机性参数；不了解时保持 `1`，不要和 temperature 一起乱调。 |
+| `model` | 服务商文档中的聊天模型名称。填写错误通常会提示模型不存在。 |
+| `temperature` | 输出随机性。首次建议 `0.8`；低于 `0.6` 时变化较少，高于 `1.0` 时偏离设定的概率更高。 |
+| `topP` | 核采样参数；不了解时保持 `1`。建议一次只调整 temperature 或 topP 中的一项。 |
 | `maxTokens` | 单次最多生成多长。首次用 `4096`；越大越完整，也越慢、越贵。`0` 表示不主动限制。 |
 | `timeout` | 最长等候时间，单位毫秒。`60000` 就是 60 秒；第一次保持默认。 |
 | `responseFormat` | 服务商支持 JSON Mode 时选 `json-object`。如果服务商报“不支持 response_format”，改成 `prompt-only`。 |
-| `extraHeaders` | 只有服务商明确要求额外请求头才填，且必须是 JSON。正常情况留空。 |
-| `extraBody` | 只有服务商文档要求额外模型参数才填，且必须是 JSON。不会写 JSON 就留空。 |
+| `extraHeaders` | 服务商明确要求额外请求头时填写，且必须为 JSON；其余情况留空。 |
+| `extraBody` | 服务商文档要求额外模型参数时填写，且必须为 JSON；其余情况留空。 |
 
-`model.failover`（故障切换）只有准备了两行及以上 providers 才需要：`enabled` 表示主服务失败时试备用服务；`priority` 表示平时总用第一行、失败才切换，最适合测试；`round-robin` 才是轮流调用；`maxAttemptsPerProvider=1` 表示失败后尽快切换；`cooldownMinutes=5` 表示失败服务 5 分钟内暂不再试。
+`model.failover`（故障切换）需要至少两条启用的 providers 配置：`enabled` 表示主服务失败时尝试备用服务；`priority` 表示优先使用第一行，失败后切换；`round-robin` 表示轮流调用；`maxAttemptsPerProvider=1` 表示每个服务商失败后立即切换；`cooldownMinutes=5` 表示失败服务在 5 分钟内暂时跳过。
 
 `model.mainPrompt` 可以写主模型的完整创作方向；`model.formatPrompt` 可以补充结构化字段说明；`model.fixedPrompt` 可以写所有故事都必须遵守的规则；`model.stylePrompt` 是全局文风。四项都可以在 Console 直接编辑。
 
@@ -509,13 +531,13 @@ onebot:
 
 | 字段 | 含义 |
 | --- | --- |
-| `enabled` | 历史兼容字段。运行时固定启用共享单主剧本，并强制每个消息平台只保留一部活动剧本；请不要依赖关闭它来创建每账号故事。 |
+| `enabled` | 历史兼容字段。运行时固定使用共享单主剧本，并限制每个消息平台仅保留一部活动剧本。 |
 | `autoEnrollParticipants` | 新 QQ 第一次私聊时自动成为主剧本参与者。 |
 | `allowCrossConversationMessages` | 允许模型在当前回合顺带给其他参与者发消息。关闭后仍共享生活，但不会跨账号主动联系。 |
 | `shareParticipantDetails` | 是否把其他账号的历史剧本交给模型。涉及隐私，默认关闭；即使打开，其他参与者的资料与关系字段仍不直接发送，模型只会通过剧本内容了解已经发生的事情。 |
 | `maxCrossConversationActions` | 一次写作最多跨账号发送几条消息。建议保持 `1`，避免角色突然群发。 |
 | `participantContextLimit` | 每次主模型最多读取多少个其他参与者的摘要。 |
-| `managerAccounts` | 可以使用 `interlude.setup`、暂停、手动推进和压缩命令的 QQ。留空保持旧行为：所有获授权账号都可管理。多人真实测试建议只填测试管理员 QQ。 |
+| `managerAccounts` | 可使用 `interlude.setup`、暂停、手动推进和压缩命令的 QQ。留空时所有获授权账号都可管理。多人测试建议仅填写测试管理员 QQ。 |
 | `participantPresets` | 仅用于读取旧版 YAML 的兼容字段；新配置统一使用 `onebot.userAccounts` 白名单行。 |
 
 旧版 `participantPresets` 示例（仅用于迁移旧 YAML，Console 中不再显示）：
@@ -545,7 +567,7 @@ sharedStory:
 
 ### 9.3 压缩模型与向量模型：第二阶段再测试
 
-`model.compaction` 是后台“记忆整理员”。它把已发生的剧本整理为场景摘要、长期事实和人物变化线索，不在用户正在等待回复的路径上运行。
+`model.compaction` 在后台将已发生剧本整理为场景摘要、长期事实和人物变化线索，不占用用户消息的主模型等待路径。
 
 | 字段 | 测试建议 |
 | --- | --- |
@@ -559,14 +581,14 @@ sharedStory:
 | `fixedPrompt` | 只写给整理员的规则，例如“保留承诺和未解决问题”。不需要时留空。 |
 | `stylePrompt` | 摘要的写法。建议保持“简短、客观、按时间顺序”，最省 token。 |
 
-`model.embedding` 是“按意思找回旧事”的可选功能，不是首次启动的必填项：
+`model.embedding` 用于按语义检索相关旧事实，首次启动可不启用：
 
 | 字段 | 测试建议 |
 | --- | --- |
 | `enabled` | 第一轮关闭；普通记忆、聊天稳定后再打开。向量服务异常时会自动退回普通排序。 |
 | `providerId` | 使用哪一行 providers 的 API Key，通常填 `primary` 或留空。 |
 | `endpoint` | 填向量（Embeddings）接口。聊天地址以 `/chat/completions` 结尾时可留空自动推导；不标准网关需按文档填写完整地址。 |
-| `model` | 向量模型名，不是聊天模型名，例如 `text-embedding-3-small`。没有向量服务就不要填写。 |
+| `model` | 向量模型名，例如 `text-embedding-3-small`。未配置向量服务时留空。 |
 | `dimensions` | 高级项。通常填 `0`，由服务商决定。 |
 | `timeout` | 默认 `10000`（10 秒）。超时只降级检索，不会让聊天失败。 |
 | `maxInputCharacters` | 默认 `4000`。越大可能更准，但会更慢、更贵。 |
@@ -580,7 +602,7 @@ sharedStory:
 | --- | --- |
 | `characterName` | 主角名字，例如“林知遥”。 |
 | `characterProfile` | 写职业、作息、性格、习惯、近期压力和说话方式。例如“夜班花店店员，慢热，忙时会短暂不回消息”。 |
-| `userProfile` | 新参与者的默认资料；不想替真实测试员预设身份就留空，也可以在 `onebot.userAccounts` 白名单行按 QQ 覆盖。 |
+| `userProfile` | 新参与者的默认资料；无需预设测试用户身份时可留空，也可在 `onebot.userAccounts` 白名单行按 QQ 覆盖。 |
 | `relationship` | 新参与者和主角的默认关系；具体账号可在 `onebot.userAccounts` 白名单行覆盖。 |
 | `world` | 写时代和世界规则，例如“2026 年上海的现实生活，没有超自然元素”。 |
 | `supportingCast` | 写重要配角，例如“店长周宁：主角的同事，关系普通”。没有就留空。 |
@@ -600,17 +622,19 @@ sharedStory:
 | `autoCreate` | 新私聊是否自动建故事。打开更省步骤；关闭时需要先用 `interlude.init`。 |
 | `ignoreCommandMessages` | 建议开启，避免管理命令被当作角色收到的聊天。 |
 | `allowProactiveMessages` | 允许角色在用户没发新消息时主动发可见消息。首次测试建议关闭，以免意外打扰或增加调用。 |
-| `sweepIntervalMinutes` | 每隔多久检查延迟回复和自动生活，默认 5 分钟；不是每次都调用模型。 |
+| `sweepIntervalMinutes` | 检查延迟回复和自动推进的间隔，默认 5 分钟；检查本身不一定调用模型。 |
 | `minimumAdvanceMinutes` | 旧版兼容项，通常不要改；实际节奏主要看 `autoAdvanceIntervalMinutes`。 |
 | `maxStoriesPerSweep` | 每次后台最多照看多少故事。单人测试保持 20。 |
 | `contextEntryLimit` / `memoryLimit` | 一次带给主模型多少最近剧本/长期事实。默认 30 / 20；越大越贵、越慢。 |
 | `maxScriptCharacters` / `maxMessageCharacters` | 幕后剧本和可见消息的最长字符数。首次保持 8000 / 2000。 |
 | `minimumDelayedReplySeconds` / `maximumDelayedReplyMinutes` | 角色可安排延迟回复的最短秒数、最长分钟数。默认 10 秒到 24 小时。 |
-| `cancelDelayedRepliesOnUserMessage` | 建议开启。用户连续发消息会取消旧延迟计划，让角色重新决定，更像真实聊天。 |
-| `autoAdvanceEnabled` | 是否在无人说话时继续补写角色生活。首次可关闭，专测聊天；测“独立生活感”时再开启。 |
+| `cancelDelayedRepliesOnUserMessage` | 建议开启。用户连续发消息时，系统会取消旧延迟计划并重新进行决策。 |
+| `autoAdvanceEnabled` | 是否在没有新消息时继续自动补写剧本。首次测试可关闭，仅验证私聊回合；之后再启用。 |
 | `autoAdvanceIntervalMinutes` | 清醒时大约多少分钟自动补写一次生活，默认 40。数值越小，细节和成本都越高。 |
 | `autoAdvanceJitterMinutes` | 自动时间前后随机浮动多少分钟。默认 5 更自然；填 0 便于固定节奏复测。 |
-| `pauseAfterConversationMinutes` | 用户说完话或延迟回复完成后，先安静多久才恢复自动生活，默认 40 分钟。 |
+| `conversationFollowUpMinutes` | 对话结束后的短期补写时间点，默认 `[10, 20]` 分钟。 |
+| `conversationFollowUpJitterMinutes` | 短期补写的随机浮动，默认 1 分钟；填 0 可固定复测。 |
+| `pauseAfterConversationMinutes` | 旧版兼容项；新的短期补写由 `conversationFollowUpMinutes` 控制。 |
 | `restWindows` | 睡眠/午休时间表，可填多行。每行有名称、开始/结束时间、最短/最长补写间隔；时间使用 `HH:mm`，例如 `23:00` 到 `07:00` 可以跨午夜。 |
 
 ### 9.6 记忆、人物变化与日志
@@ -634,7 +658,7 @@ sharedStory:
 | `majorStatePatchConfidenceThreshold` / `allowMajorStateChanges` | 重大变化的更严格门槛和自动应用开关。保守测试可关闭自动重大变化。 |
 | `autoApplyStatePatches` | 是否自动应用满足门槛的慢变化；想人工审核每次变化时关闭。 |
 
-`logging` 只影响排查信息，不影响角色：默认 `level=info`、`format=detailed` 会用中文分行显示收到私聊、模型决策完成、消息投递、自动推进和压缩完成；出现 API 或模型问题时可临时切到 `debug`。`logScriptPreview` 控制是否输出当前剧本内容，`logMessageContent` 控制是否输出用户消息和主角可见消息内容；两项都可能暴露私聊内容，排查后应关闭。
+`logging` 只影响排查信息，不影响角色。默认建议使用 `level=info`、`verbosity=standard`、`format=detailed`：日志会按中文分行显示模型调用、后台扫描、自动推进、到期计划、计时器、消息投递、记忆整理和归档结果。`verbosity=summary` 只保留关键结果与失败；`verbosity=diagnostic` 追加队列、跳过原因和上下文统计，适合定位时序问题。`logScriptPreview` 控制是否输出当前剧本内容，`logMessageContent` 控制是否输出用户消息和主角可见消息内容；两项都可能暴露私聊内容，排查后应关闭。
 
 推荐实践：
 
@@ -663,10 +687,11 @@ sharedStory:
 | interlude.memory.forget <id> | 管理员将长期事实标记为失效 |
 | interlude.memory.intents [limit] / cancel <id> | 管理员查看或取消等待中的意图 |
 | interlude.memory.patches [limit] / reject <id> | 管理员查看或拒绝设定演化提案 |
-| interlude.database.clear <confirmation> | 管理员清空 HDSI 自有 SQLite 表，不影响 Koishi 或其它插件 |
-| interlude.purge.all <confirmation> | 管理员彻底重置所有平台的剧本、派生记忆和 Canon，需要确认口令 |
-| interlude.purge.platform <platform> <confirmation> | 管理员清空并归档指定平台的全部故事，例如 sandbox 或 onebot |
-| interlude.purge.range <from> <to> <confirmation> | 管理员删除指定时间段的剧本和关联记忆 |
+| interlude.overlay.clear <target> | 管理员清理 character、relationship、world 或 all 的演化 overlay；随后回复 y/n |
+| interlude.database.clear | 管理员清空 HDSI 自有 SQLite 表；随后回复 y/n |
+| interlude.purge.all | 管理员彻底重置所有平台的剧本、派生记忆和 Canon；随后回复 y/n |
+| interlude.purge.platform <platform> | 管理员清空并归档指定平台的全部故事；随后回复 y/n |
+| interlude.purge.range <from> <to> | 管理员删除指定时间段的剧本和关联记忆；随后回复 y/n |
 
 删除指令会先尝试物理删除；如果 SQLite 文件被占用，插件会自动降级为逻辑删除并清空正文，避免删除操作因 `disk I/O error` 中断。
 
@@ -689,12 +714,19 @@ ctx.interlude.setNarrator(myNarrativeProvider)
 ctx.interlude.setCompactor(myNarrativeCompactor)
 ~~~
 
-主叙事器实现 NarrativeProvider.decide(request)。压缩器实现 NarrativeCompactor.compact(request)。二者都是结构化接口，因此可以改接本地模型、任务队列、RAG 服务或专门的长期记忆服务。
+## 0.1.1-beta4-refactor：运行日志与任务可观测性
+
+- 新增 `logging.verbosity`：`summary`、`standard`、`diagnostic` 三档运行信息密度。
+- 默认标准档显示主模型与群聊判断调用、自动推进、到期计划、计时器、消息投递、记忆整理和主剧本归档状态。
+- 诊断档追加消息合并、队列等待、后台跳过原因、冷却期和上下文统计；消息正文仍由隐私开关单独控制。
+- 日志统一使用任务、阶段、故事和结果字段，便于在 Koishi Console 中定位后台状态与异常。
+
+群聊、网页观察和可替换叙事器/压缩器仍按前文配置使用；完整命令说明见 [`command.md`](command.md)。
 
 ## 12. 运行边界
 
 - HDSI 提供叙事连续性机制，不保证模型生成的文学质量、事实正确性或内容安全。
-- 延迟回复到期后会再次做剧情判断，不是一个无条件发送定时器。
+- 延迟回复到期后会再次进行剧情判断，由模型决定是否投递消息。
 - 压缩摘要是辅助记忆。原始剧本保留在数据库中，允许审计和重建。
 - 当前串行队列位于单个 Node.js 进程内。多实例部署需要分布式锁。
 - 长期运行时，数据库体积、检索质量、摘要漂移和隐私保护需要额外的生产级方案。

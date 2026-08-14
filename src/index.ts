@@ -1,12 +1,12 @@
 import { Context, Schema, Session } from 'koishi'
-import { CompactionConfig, EmbeddingConfig, FailoverConfig, ModelConfig, ProviderConfig } from './narrator'
-import { Config as InterludeConfig, InterludeService, LoggingConfig, MemoryConfig, OneBotAccountRule, OneBotNapCatConfig, RestWindow, RuntimeConfig, SharedStoryConfig, StoryDefaults } from './service'
+import { CompactionConfig, EmbeddingConfig, FailoverConfig, GroupGateConfig, ModelConfig, ProviderConfig } from './narrator'
+import { BrowserConfig, Config as InterludeConfig, GroupChatRule, InterludeService, LoggingConfig, MemoryConfig, OneBotAccountRule, OneBotNapCatConfig, RestWindow, RuntimeConfig, SharedStoryConfig, StoryDefaults } from './service'
 import { StorySetting } from './types'
 
 declare module 'koishi' { interface Context { interlude: InterludeService } }
 
 export const name = 'hds-interlude'
-export const inject = ['database', 'http']
+export const inject = { required: ['database', 'http'], optional: ['puppeteer'] }
 
 const defaultProvider: ProviderConfig = {
   id: 'primary',
@@ -40,6 +40,19 @@ const Provider: Schema<ProviderConfig> = Schema.object({
   extraBody: Schema.string().role('textarea').default('').description('额外请求体字段，必须是 JSON 对象；无特殊需求留空。'),
 })
 
+// Model credentials live once in providers; this catalogue only describes
+// which model names are available behind each provider.
+const ModelProfile: Schema<import('./narrator').ModelProfile> = Schema.object({
+  id: Schema.string().default('').description('模型预设 ID。各功能通过它引用模型，例如 main-writing。'),
+  label: Schema.string().default('').description('模型预设备注，方便在配置中识别。'),
+  enabled: Schema.boolean().default(true).description('是否允许各功能继续选择这个模型预设。'),
+  providerId: Schema.string().default('').description('对应的服务商 ID，必须与 providers 中的一行一致。'),
+  model: Schema.string().default('').description('服务商实际要求的模型名称。'),
+  maxTokens: Schema.natural().min(0).max(100_000).default(4096).description('该模型的默认最大输出 token 数。'),
+  timeout: Schema.natural().min(1_000).max(300_000).default(60_000).role('ms').description('该模型的默认请求超时时间。'),
+  responseFormat: Schema.union(['json-object', 'prompt-only']).default('json-object').description('该模型是否支持 JSON mode。'),
+}).collapse(true)
+
 const Failover: Schema<FailoverConfig> = Schema.object({
   enabled: Schema.boolean().default(true).description('主服务商失败时是否尝试其它已启用服务商。'),
   strategy: Schema.union(['priority', 'round-robin']).default('priority').description('priority 按配置顺序选择；round-robin 轮换选择。'),
@@ -48,6 +61,7 @@ const Failover: Schema<FailoverConfig> = Schema.object({
 })
 
 const Embedding: Schema<EmbeddingConfig> = Schema.object({
+  modelId: Schema.string().default('').description('模型预设 ID；填写后优先使用 model.models 中对应的模型。'),
   liveQuery: Schema.boolean().default(false).description('是否在每次实时对话中额外请求 Embedding 做语义检索。关闭可减少一次网络请求、降低回复延迟；后台向量补齐不受影响。'),
   enabled: Schema.boolean().default(false).description('启用长期事实的语义检索。关闭时退化为规则排序。'),
   providerId: Schema.string().default('').description('生成向量所使用的服务商 id；留空时自动选择。'),
@@ -59,7 +73,27 @@ const Embedding: Schema<EmbeddingConfig> = Schema.object({
   backfillBatchSize: Schema.natural().min(0).max(100).default(5).description('每轮后台补齐向量的事实数量；0 表示不补齐旧记录。'),
 })
 
+const GroupGate: Schema<GroupGateConfig> = Schema.object({
+  modelId: Schema.string().default('').description('模型预设 ID；填写后优先使用 model.models 中对应的模型。'),
+  topP: Schema.number().min(0).max(1).default(1).description('快速判断模型的核采样概率。'),
+  enabled: Schema.boolean().default(false).description('是否启用群聊快速判断模型。'),
+  providerId: Schema.string().default('').description('快速判断模型使用的服务商 ID；留空自动选择。'),
+  model: Schema.string().default('').description('快速判断模型名称，建议使用便宜且响应快的小模型。'),
+  temperature: Schema.number().min(0).max(2).default(0.2).description('快速判断模型的随机性，建议较低。'),
+  maxTokens: Schema.natural().min(100).max(2_000).default(500).description('快速判断模型最多输出的 token 数。'),
+  timeout: Schema.natural().min(1_000).max(60_000).default(10_000).role('ms').description('快速判断请求超时时间，单位毫秒。'),
+  threshold: Schema.number().min(0).max(1).default(0.65).description('进入主叙事模型的最低分数，越高越安静。'),
+  prompt: Schema.string().role('textarea').default('').description('追加给群聊快速判断模型的自定义提示词。'),
+})
+
 const Model: Schema<ModelConfig> = Schema.object({
+  models: Schema.array(ModelProfile).role('table').default([]).description('一次性登记所有可用模型；各调用功能通过模型预设 ID 引用。'),
+  mainModelId: Schema.string().default('').description('主叙事模型预设 ID；留空时兼容使用 providers 的默认模型。'),
+  mainTemperature: Schema.number().min(0).max(2).default(0.8).description('主叙事模型的温度覆盖值。'),
+  mainTopP: Schema.number().min(0).max(1).default(1).description('主叙事模型的 top-p 覆盖值。'),
+  mainMaxTokens: Schema.natural().min(0).max(100_000).default(0).description('主叙事模型最大输出；0 时使用模型预设或服务商默认值。'),
+  mainTimeout: Schema.natural().min(0).max(300_000).default(0).role('ms').description('主叙事模型超时时间；0 时使用模型预设或服务商默认值。'),
+  mainResponseFormat: Schema.union(['json-object', 'prompt-only']).default('json-object').description('主叙事模型的响应格式。'),
   mode: Schema.union(['fallback', 'openai-compatible']).default('fallback').description('模型调用模式；fallback 仅用于未配置服务商时的本地回退。'),
   // 服务商字段较多，使用可折叠的纵向表单；横向 table 在 Console 窄屏上会溢出。
   providers: Schema.array(Provider.collapse(true)).default([defaultProvider]).description('聊天服务商列表；折叠行可避免窄屏横向溢出。'),
@@ -68,8 +102,10 @@ const Model: Schema<ModelConfig> = Schema.object({
   formatPrompt: Schema.string().role('textarea').default('').description('结构化输出补充说明；只能扩展固定协议，不能覆盖 JSON、时间和安全校验。'),
   fixedPrompt: Schema.string().role('textarea').default('').description('所有故事通用的长期约束。'),
   stylePrompt: Schema.string().role('textarea').default('Use restrained, realistic prose with concrete daily details, natural pauses, and no forced drama.').description('全局叙事文风；故事级 style 可进一步覆盖。'),
-  embedding: Embedding.default({ enabled: false, providerId: '', endpoint: '', model: '', dimensions: 0, timeout: 10_000, maxInputCharacters: 4_000, backfillBatchSize: 5 }).description('长期事实的语义召回设置。'),
+  embedding: Embedding.default({ enabled: false, modelId: '', providerId: '', endpoint: '', model: '', dimensions: 0, timeout: 10_000, maxInputCharacters: 4_000, backfillBatchSize: 5 }).description('长期事实的语义召回设置。'),
+  groupGate: GroupGate.default({ enabled: false, modelId: '', providerId: '', model: '', temperature: 0.2, topP: 1, maxTokens: 500, timeout: 10_000, threshold: 0.65, prompt: '' }).description('群聊进入主叙事模型前的快速筛选模型。'),
   compaction: (Schema.object({
+    modelId: Schema.string().default('').description('模型预设 ID；填写后优先使用 model.models 中对应的模型。'),
     enabled: Schema.boolean().default(true).description('启用后台剧本压缩与长期事实提取。'),
     providerId: Schema.string().default('').description('压缩请求使用的服务商 id；留空时自动选择。'),
     model: Schema.string().default('').description('压缩模型标识；建议使用低成本模型。'),
@@ -81,7 +117,7 @@ const Model: Schema<ModelConfig> = Schema.object({
     mainPrompt: Schema.string().role('textarea').default('Compress completed scenes into concise continuity notes while preserving causality, promises, unresolved matters, and gradual character change.').description('压缩任务指令：定义摘要、事实和状态变更的提取目标。'),
     fixedPrompt: Schema.string().role('textarea').default('').description('压缩器必须遵守的长期规则。'),
     stylePrompt: Schema.string().role('textarea').default('Concise, factual, chronological, and concrete.').description('压缩结果的表达风格。'),
-  }) as unknown as Schema<CompactionConfig>).default({ enabled: true, providerId: '', model: '', temperature: 0.3, topP: 1, maxTokens: 2048, timeout: 60_000, responseFormat: 'json-object', mainPrompt: 'Compress completed scenes into concise continuity notes while preserving causality, promises, unresolved matters, and gradual character change.', fixedPrompt: '', stylePrompt: 'Concise, factual, chronological, and concrete.' }),
+  }) as unknown as Schema<CompactionConfig>).default({ enabled: true, modelId: '', providerId: '', model: '', temperature: 0.3, topP: 1, maxTokens: 2048, timeout: 60_000, responseFormat: 'json-object', mainPrompt: 'Compress completed scenes into concise continuity notes while preserving causality, promises, unresolved matters, and gradual character change.', fixedPrompt: '', stylePrompt: 'Concise, factual, chronological, and concrete.' }),
 })
 
 const RestWindowSchema: Schema<RestWindow> = Schema.object({
@@ -108,7 +144,7 @@ const Runtime: Schema<RuntimeConfig> = Schema.object({
   ignoreCommandMessages: Schema.boolean().default(true).description('是否跳过 interlude.* 管理命令，避免进入剧本。'),
   allowProactiveMessages: Schema.boolean().default(false).description('是否允许无新消息时向参与者主动发送可见消息。'),
   sweepIntervalMinutes: Schema.natural().min(1).max(1_440).default(5).description('后台扫描周期；仅用于发现到期任务，不代表每轮都调用模型。'),
-  minimumAdvanceMinutes: Schema.natural().min(1).max(10_080).default(30).description('旧版兼容字段；自动生活主要由 autoAdvanceIntervalMinutes 控制。'),
+  minimumAdvanceMinutes: Schema.natural().min(1).max(10_080).default(30).description('手动“interlude.advance”的最小有效补写间隔；到期计划和对话后的短期补写不受此限制。'),
   maxStoriesPerSweep: Schema.natural().min(1).max(1_000).default(20).description('单轮后台扫描最多处理的主剧本数量。'),
   contextEntryLimit: Schema.natural().min(1).max(200).default(30).description('主模型读取的最近剧本条目数；越大越耗 token。'),
   memoryLimit: Schema.natural().min(1).max(200).default(20).description('主模型读取的长期事实数量；会经过相关性重排。'),
@@ -120,10 +156,32 @@ const Runtime: Schema<RuntimeConfig> = Schema.object({
   autoAdvanceEnabled: Schema.boolean().default(true).description('无对话时是否按真实时间补写角色生活。'),
   autoAdvanceIntervalMinutes: Schema.natural().min(5).max(1_440).default(40).description('普通时段自动推进的目标间隔，单位分钟。'),
   autoAdvanceJitterMinutes: Schema.natural().min(0).max(60).default(5).description('自动推进间隔的随机浮动范围，单位分钟。'),
-  pauseAfterConversationMinutes: Schema.natural().min(1).max(1_440).default(40).description('对话或延迟投递完成后暂停自动生活的时长。'),
+  conversationFollowUpMinutes: Schema.array(Schema.natural().min(1).max(240)).default([10, 20]).description('一段对话结束后，额外补写生活的时间点，单位分钟。默认约第 10、20 分钟。'),
+  conversationFollowUpJitterMinutes: Schema.natural().min(0).max(10).default(1).description('短期补写的随机浮动范围，单位分钟。填 0 可固定在指定时间点。'),
+  pauseAfterConversationMinutes: Schema.natural().min(1).max(1_440).default(40).description('旧版兼容项；短期补写和普通推进主要由上方选项控制。'),
   restWindows: Schema.array(RestWindowSchema).role('table').default([
     { enabled: true, label: 'night sleep', start: '23:00', end: '07:00', minIntervalMinutes: 120, maxIntervalMinutes: 240 },
   ]).description('可配置多个低频推进窗口，例如睡眠或午休。'),
+})
+
+const Browser: Schema<BrowserConfig> = Schema.object({
+  enabled: Schema.boolean().default(false).description('启用 Puppeteer 只读网页观察。还需要在 Koishi 安装并启用 puppeteer 插件；未启用时聊天功能不受影响。'),
+  mode: Schema.union(['deferred-only', 'allow-immediate']).default('deferred-only').description('延后浏览不会增加当前回复等待；允许即时浏览时，主模型可为少数当前私聊额外读取一次网页，因此回复会更慢。'),
+  allowSearch: Schema.boolean().default(true).description('允许主角提出网页搜索意图。搜索结果会作为之后的网页观察进入剧本。'),
+  allowVisit: Schema.boolean().default(true).description('允许主角访问安全策略允许的公开网页 URL。不会登录、填写表单、下载或发布内容。'),
+  searchUrlTemplate: Schema.string().default('https://html.duckduckgo.com/html/?q={query}').description('搜索地址模板，必须包含 {query}。默认使用 DuckDuckGo 的轻量结果页。'),
+  allowedDomains: Schema.array(Schema.string()).role('table').default([]).description('允许访问的域名白名单；留空表示不额外限制。填入后，仅这些域名及其子域名可访问。'),
+  blockedDomains: Schema.array(Schema.string()).role('table').default([]).description('永远禁止访问的域名黑名单；localhost、私网地址和非 HTTP(S) 地址始终禁止。'),
+  maxConcurrentPages: Schema.natural().min(1).max(4).default(1).description('同时打开的网页页数上限。建议保持 1，避免浏览器占用影响 Koishi。'),
+  maxResearchPerSweep: Schema.natural().min(1).max(20).default(1).description('每轮后台最多处理的网页浏览意图数。保持 1 可避免网页积压拖慢剧本队列。'),
+  navigationTimeout: Schema.natural().min(1_000).max(120_000).default(15_000).role('ms').description('单页加载超时，单位毫秒。超时会记录失败观察，不会中断剧本。'),
+  waitUntil: Schema.union(['domcontentloaded', 'networkidle2']).default('domcontentloaded').description('读取网页的等待条件。domcontentloaded 更快；networkidle2 对动态页面更完整但更慢。'),
+  maxTextCharacters: Schema.natural().min(500).max(50_000).default(12_000).description('从网页正文提取的最大字符数。仅提取可见文本，不保存 HTML。'),
+  maxExcerptCharacters: Schema.natural().min(200).max(12_000).default(3_000).description('单条网页观察送给主模型的最大字符数。'),
+  maxObservationsInPrompt: Schema.natural().min(1).max(20).default(4).description('单次主叙事请求附带的最近网页观察数量。'),
+  cacheMinutes: Schema.natural().min(0).max(10_080).default(30).description('相同搜索或 URL 在此时间内复用已有观察，减少重复浏览；0 表示每次重新读取。'),
+  allowGroupTriggeredResearch: Schema.boolean().default(false).description('允许群聊主叙事产生浏览意图。默认关闭，避免群成员内容触发角色浏览。'),
+  logObservationPreview: Schema.boolean().default(false).description('在日志中显示网页观察的标题和节选；网页内容可能包含隐私或不可信文本，生产环境建议关闭。'),
 })
 
 const Memory: Schema<MemoryConfig> = Schema.object({
@@ -151,14 +209,18 @@ const Memory: Schema<MemoryConfig> = Schema.object({
   unresolvedWeight: Schema.number().min(0).max(2).default(0.2).description('未解决事项的额外排序权重。'),
   autoApplyStatePatches: Schema.boolean().default(true).description('是否自动应用达到门槛的设定演化建议。'),
   allowMajorStateChanges: Schema.boolean().default(true).description('是否允许自动应用重大人物或世界状态变更。'),
+  activeConsequencesEnabled: Schema.boolean().default(true).description('启用“剧情余波”：让确实影响后续生活的谈话或事件，在之后的写作中持续发挥短期作用。关闭后不会新增或注入余波。'),
+  activeConsequencePromptLimit: Schema.natural().min(1).max(20).default(6).description('单次主模型写作最多携带几条仍在生效的剧情余波。数值越高，连续性更强，但会增加少量上下文。'),
+  activeConsequenceMaxDays: Schema.natural().min(1).max(30).default(7).description('一条剧情余波最长保留多少天。到期后会自然淡出；它不用于永久修改角色设定。'),
+  activeConsequenceDefaultStrength: Schema.number().min(0).max(1).step(0.05).default(0.55).description('剧情余波未写明强度时的默认影响程度。0 表示极轻微，1 表示会明显影响主角近期生活。'),
 })
 
 const StoryDefaults: Schema<StoryDefaults> = Schema.object({
   characterName: Schema.string().default('Unnamed character').description('主角显示名称。'),
-  characterProfile: Schema.string().role('textarea').default('').description('主角的背景、性格、日程和说话方式；作为故事起点，不是永久锁定的人设。'),
+  characterProfile: Schema.string().role('textarea').default('').description('主角的背景、性格、日程和说话方式；作为故事起点，不是永久锁定的人设。若这里发生大幅修改，请保存后执行 interlude.overlay.clear character，随后按提示输入 y 确认；小幅补充、措辞调整或细节修正无需其它操作。'),
   userProfile: Schema.string().role('textarea').default('').description('未单独配置参与者时使用的默认用户资料；可被白名单行覆盖。'),
-  relationship: Schema.string().role('textarea').default('').description('未单独配置参与者时使用的初始关系；可被白名单行覆盖。'),
-  world: Schema.string().role('textarea').default('').description('故事时代、地点和现实规则；作为剧本的初始世界状态。'),
+  relationship: Schema.string().role('textarea').default('').description('未单独配置参与者时使用的初始关系；可被白名单行覆盖。大幅改变关系定位时执行 interlude.overlay.clear relationship，随后按提示输入 y 确认；小幅调整无需处理。'),
+  world: Schema.string().role('textarea').default('').description('故事时代、地点和现实规则；作为剧本的初始世界状态。若大幅改写世界前提，请执行 interlude.overlay.clear world，随后按提示输入 y 确认；小幅补充无需处理。'),
   supportingCast: Schema.string().role('textarea').default('').description('配角及其与主角的关系；无配角可留空。'),
   location: Schema.string().default('').description('主角的主要活动地点。'),
   style: Schema.string().role('textarea').default('现实主义日常叙事，情绪克制，关系变化缓慢而具体。').description('该主剧本的文风；优先级高于全局 stylePrompt。'),
@@ -166,8 +228,9 @@ const StoryDefaults: Schema<StoryDefaults> = Schema.object({
 })
 
 const Logging: Schema<LoggingConfig> = Schema.object({
-  level: Schema.union(['silent', 'error', 'warn', 'info', 'debug']).default('info').description('日志阈值；info 显示正常生命周期，debug 追加详细诊断。'),
-  format: Schema.union(['compact', 'detailed']).default('detailed').description('compact 为单行摘要；detailed 将故事、阶段和事件拆成多行，便于阅读。'),
+  level: Schema.union(['silent', 'error', 'warn', 'info', 'debug']).default('info').description('错误级别阈值。日常运行建议保持 info；排查异常时临时使用 debug。'),
+  verbosity: Schema.union(['summary', 'standard', 'diagnostic']).default('standard').description('运行信息密度：摘要只显示关键结果；标准显示模型、计时器和后台任务；诊断追加跳过原因、队列和上下文统计。'),
+  format: Schema.union(['compact', 'detailed']).default('detailed').description('显示布局：compact 为单行；detailed 将任务、故事、状态和详情分行显示。'),
   logScriptPreview: Schema.boolean().default(false).description('是否输出本轮剧本内容；可能包含私聊信息，生产环境建议关闭。'),
   logMessageContent: Schema.boolean().default(false).description('是否输出用户消息和主角可见消息内容；涉及隐私，生产环境建议关闭。'),
   previewLength: Schema.natural().min(50).max(4_000).default(500).description('剧本和消息内容写入日志时的最大字符数。'),
@@ -179,8 +242,8 @@ const OneBotBotAccount: Schema<OneBotAccountRule> = Schema.object({
   enabled: Schema.boolean().default(true).description('是否允许此机器人账号投递角色消息。'),
 })
 
-// The allowlist is also the identity sheet for the shared story. Collapsing
-// each row keeps the Console usable when a tester has many QQ accounts.
+// The allowlist is also the identity sheet for the shared story. Each row is
+// a collapsible card, so the two long narrative fields get full-width editors.
 const OneBotUserAccount: Schema<OneBotAccountRule> = Schema.object({
   qq: Schema.string().default('').description('允许互动的用户 QQ；未列出的账号直接拒绝。'),
   label: Schema.string().default('').description('主角对该用户的称呼；留空时使用平台昵称。'),
@@ -190,10 +253,23 @@ const OneBotUserAccount: Schema<OneBotAccountRule> = Schema.object({
   enabled: Schema.boolean().default(true).description('是否接受该账号的私聊并允许向其投递消息。'),
 }).collapse(true)
 
+const GroupChatRuleSchema: Schema<GroupChatRule> = Schema.object({
+  groupId: Schema.string().default('').description('QQ 群号。只有列在这里且启用的群会被插件处理。'),
+  label: Schema.string().default('').description('群聊备注，帮助主模型理解这个群。'),
+  enabled: Schema.boolean().default(true).description('是否允许插件读取并参与这个群。'),
+  purpose: Schema.string().role('textarea').default('').description('这个群主要做什么，例如“同事讨论项目”或“朋友闲聊”。'),
+  characterRole: Schema.string().role('textarea').default('').description('主角在群里的身份和说话位置。'),
+  responseMode: Schema.union(['mention-only', 'selective', 'active']).default('selective').description('仅被 @ 时判断、选择性判断所有消息，或更积极地参与。active 仍只响应收到的群消息。'),
+  contextLimit: Schema.natural().min(4).max(100).default(20).description('送给快速判断模型和主模型的最近群消息条数。'),
+  debounceSeconds: Schema.number().min(0).max(10).default(1).description('合并短时间连续群消息后再判断的等待秒数。'),
+  cooldownSeconds: Schema.natural().min(0).max(86_400).default(60).description('主角群发言后的冷却时间，避免连续刷屏。'),
+}).collapse(true)
+
 const OneBot: Schema<OneBotNapCatConfig> = Schema.object({
   enabled: Schema.boolean().default(true).description('启用 OneBot/NapCat 账号过滤。'),
   botAccounts: Schema.array(OneBotBotAccount).role('table').default([]).description('允许投递角色消息的机器人账号；为空时不限制机器人账号。'),
-  userAccounts: Schema.array(OneBotUserAccount).role('table').default([]).description('用户白名单及关系初始化表；空表拒绝所有用户。展开行填写人物资料。'),
+ userAccounts: Schema.array(OneBotUserAccount).default([]).description('用户白名单及关系初始化表；改用纵向卡片展开，人物资料和关系文本会有更宽的编辑区域。空表拒绝所有用户。'),
+  groupChats: Schema.array(GroupChatRuleSchema).default([]).description('群聊白名单。每个群以可折叠卡片显示，适合填写群用途和角色定位。群成员无需重复加入私聊用户白名单。'),
   ignoreSelfMessages: Schema.boolean().default(true).description('忽略机器人自身产生的消息事件。'),
 })
 
@@ -208,12 +284,13 @@ const SharedStory: Schema<SharedStoryConfig> = Schema.object({
 })
 
 export const Config: Schema<InterludeConfig> = Schema.object({
-  onebot: OneBot.description('OneBot/NapCat 的机器人账号和用户白名单。'),
-  sharedStory: SharedStory.description('多人共享主剧本及跨账号行为。'),
-  memory: Memory.description('剧本压缩、事实召回和设定演化。'),
-  model: Model.description('主叙事、压缩和 Embedding 模型配置。'),
-  runtime: Runtime.description('消息接管、延迟回复和自动推进调度。'),
-  storyDefaults: StoryDefaults.description('新主剧本的初始 Canon。'),
+ onebot: OneBot.description('OneBot/NapCat 的机器人账号和用户白名单。'),
+ storyDefaults: StoryDefaults.description('新主剧本的 Canon、角色、世界、关系和叙事风格。'),
+  model: Model.description('第三步：集中配置服务商、模型预设、主叙事模型和各专项模型。'),
+ sharedStory: SharedStory.description('多人共享主剧本及跨账号行为。'),
+  runtime: Runtime.description('消息合并、延迟发送、失败重试和自动剧本推进。'),
+  memory: Memory.description('剧本压缩、事实召回、剧情余波和设定演化。'),
+  browser: Browser.description('Puppeteer 只读网页浏览、网页观察与安全边界。'),
   logging: Logging.description('运行日志级别、格式和隐私选项。'),
 })
 
@@ -224,8 +301,15 @@ export function apply(ctx: Context, config: InterludeConfig) {
   registerCommands(ctx, service)
 
   ctx.middleware(async (session, next) => {
-    if (!config.runtime.captureDirectMessages || !session.isDirect || !session.content?.trim()) return next()
+    if (!session.content?.trim()) return next()
+    // Management commands must remain visible to Koishi's command parser,
+    // including when they are sent inside an authorized group.
     if (config.runtime.ignoreCommandMessages && looksLikeInterludeCommand(session.content)) return next()
+    if (!session.isDirect) {
+      const consumed = await service.receiveGroup(session)
+      return consumed ? undefined : next()
+    }
+    if (!config.runtime.captureDirectMessages) return next()
     const consumed = await service.receive(session)
     return consumed ? undefined : next()
   })
@@ -388,14 +472,20 @@ function registerCommands(ctx: Context, service: InterludeService) {
       return await service.forgetAdminFact(story.id, id) ? `长期事实 #${id} 已标记为失效。` : `未找到有效的长期事实 #${id}。`
     })
 
-  ctx.command('interlude.memory.intents [limit:number]', '管理员：查看等待中的延迟回复和后续联系计划')
+  ctx.command('interlude.memory.intents [limit:number]', '管理员：查看等待中的计划、提醒、承诺与剧情余波')
     .action(async ({ session }, limit = 20) => {
       if (!requireManager(service, session)) return '当前 QQ 没有共享主剧本的管理权限。'
       const story = await requireStory(service, session)
       if (typeof story === 'string') return story
       const intents = await service.adminPendingIntents(story.id, limit)
-      if (!intents.length) return '当前没有等待中的意图或延迟消息。'
-      return intents.map(intent => `#${intent.id} [${intent.type}] 参与者=${intent.participantId || '全局'} 最早执行=${intent.notBefore.toISOString()}\n${intent.summary}`).join('\n\n')
+      if (!intents.length) return '当前没有等待中的计划、提醒、承诺或剧情余波。'
+      return intents.map(intent => {
+        const active = intent.type === 'active-consequence' && intent.payload?.lifecycle === 'active'
+        const timing = active
+          ? `持续影响至=${String(intent.payload?.expiresAt || '未设置')}`
+          : `最早执行=${intent.notBefore.toISOString()}`
+        return `#${intent.id} [${intent.type}] 参与者=${intent.participantId || '全局'} ${timing}\n${intent.summary}`
+      }).join('\n\n')
     })
 
   ctx.command('interlude.memory.cancel <id:number>', '管理员：取消指定的等待中意图或延迟消息')
@@ -424,28 +514,41 @@ function registerCommands(ctx: Context, service: InterludeService) {
       return await service.rejectAdminStatePatch(story.id, id) ? `设定演化提案 #${id} 已拒绝。` : `未找到待审核的设定演化提案 #${id}。`
     })
 
-  ctx.command('interlude.database.clear <confirmation:text>', '管理员：清空 HDSI 自有 SQLite 数据表；不会删除 Koishi 用户和其它插件数据')
-    .action(async ({ session }, confirmation) => {
+  ctx.command('interlude.overlay.clear <target:string>', '管理员：只清理指定部分的设定演化 overlay，不删除剧本和记忆；执行前会询问 y/n')
+    .action(async ({ session }, target) => {
       if (!requireManager(service, session)) return '无权限：当前账号不是 HDSI 管理员。'
-      if (confirmation !== '确认清空HDSI数据库') return '为防止误删，请完整输入：确认清空HDSI数据库'
+      const normalized = String(target || '').trim().toLowerCase() as 'character' | 'relationship' | 'world' | 'all'
+      if (!['character', 'relationship', 'world', 'all'].includes(normalized)) return 'target 必须是 character、relationship、world 或 all。'
+      if (!await askConfirmation(session, `即将清理 ${normalized} overlay；剧本和记忆不会删除。确认执行吗？(y/n)`)) return '操作已取消。'
+      const story = await requireStory(service, session)
+      if (typeof story === 'string') return story
+      const result = await service.clearSettingOverlay(story, normalized)
+      const participantNote = normalized === 'relationship' || normalized === 'all' ? `，已清理 ${result.participantCount} 个参与者关系 overlay` : ''
+      return `已清理 ${normalized} overlay${participantNote}；剧本、长期事实和普通记忆均未删除。`
+    })
+
+  ctx.command('interlude.database.clear', '管理员：清空 HDSI 自有 SQLite 数据表；不会删除 Koishi 用户和其它插件数据；执行前会询问 y/n')
+    .action(async ({ session }) => {
+      if (!requireManager(service, session)) return '无权限：当前账号不是 HDSI 管理员。'
+      if (!await askConfirmation(session, '即将清空 HDSI 自有数据库，剧本、记忆和状态记录都会删除。确认执行吗？(y/n)')) return '操作已取消。'
       const result = await service.clearDatabase()
       return `HDSI 数据库清空完成：处理 ${result.removed} 条记录${result.logicallyCleared ? `，其中 ${result.logicallyCleared} 条因 SQLite 锁定改为逻辑清空` : ''}。`
     })
 
-  ctx.command('interlude.purge.all <confirmation:text>', '管理员：彻底重置所有平台的剧本、记忆与 Canon；需要确认口令')
-    .action(async ({ session }, confirmation) => {
+  ctx.command('interlude.purge.all', '管理员：彻底重置所有平台的剧本、记忆与 Canon；执行前会询问 y/n')
+    .action(async ({ session }) => {
       if (!requireManager(service, session)) return '当前 QQ 没有共享主剧本的管理权限。'
-      if (confirmation !== '确认删除全部剧本和记忆') return '为防止误删，请完整输入：确认删除全部剧本和记忆'
+      if (!await askConfirmation(session, '即将删除所有平台的剧本、记忆、事实、意图和状态。确认执行吗？(y/n)')) return '操作已取消。'
       const story = await requireStory(service, session)
       if (typeof story === 'string') return story
       await service.purgeAllData(story.id)
       return '已彻底重置所有平台：旧剧本、场景摘要、剧情弧线、长期事实、记忆、意图、状态演化和参与者关系状态均已清除；当前故事保留为空白的全局主剧本，Canon 已按当前 Console 配置重建。'
     })
 
-  ctx.command('interlude.purge.platform <platform:string> <confirmation:text>', '管理员：删除指定平台的全部剧本和记忆；例如 sandbox 或 onebot')
-    .action(async ({ session }, platform, confirmation) => {
+  ctx.command('interlude.purge.platform <platform:string>', '管理员：删除指定平台的全部剧本和记忆；例如 sandbox 或 onebot；执行前会询问 y/n')
+    .action(async ({ session }, platform) => {
       if (!requireManager(service, session)) return '当前 QQ 没有共享主剧本的管理权限。'
-      if (confirmation !== '确认删除平台剧本和记忆') return '为防止误删，请完整输入：确认删除平台剧本和记忆'
+      if (!await askConfirmation(session, `即将删除平台 ${platform} 的全部剧本和记忆。确认执行吗？(y/n)`)) return '操作已取消。'
       const normalized = String(platform ?? '').trim().toLowerCase()
       if (!normalized) return '请填写平台名，例如 sandbox 或 onebot。'
       const count = await service.purgePlatformData(normalized)
@@ -454,10 +557,10 @@ function registerCommands(ctx: Context, service: InterludeService) {
         : `没有找到平台 ${normalized} 的 HDSI 剧本。`
     })
 
-  ctx.command('interlude.purge.range <from:text> <to:text> <confirmation:text>', '管理员：删除时间范围内的剧本和关联记忆；时间使用 ISO-8601')
-    .action(async ({ session }, fromText, toText, confirmation) => {
+  ctx.command('interlude.purge.range <from:text> <to:text>', '管理员：删除时间范围内的剧本和关联记忆；时间使用 ISO-8601；执行前会询问 y/n')
+    .action(async ({ session }, fromText, toText) => {
       if (!requireManager(service, session)) return '当前 QQ 没有共享主剧本的管理权限。'
-      if (confirmation !== '确认删除时间段剧本和记忆') return '为防止误删，请完整输入：确认删除时间段剧本和记忆'
+      if (!await askConfirmation(session, `即将删除 ${fromText} 至 ${toText} 范围内的剧本和关联记忆。确认执行吗？(y/n)`)) return '操作已取消。'
       const from = new Date(fromText)
       const to = new Date(toText)
       if (!Number.isFinite(from.getTime()) || !Number.isFinite(to.getTime()) || from > to) return '时间范围无效，请使用 ISO-8601，例如 2026-08-01T00:00:00+08:00。'
@@ -466,6 +569,12 @@ function registerCommands(ctx: Context, service: InterludeService) {
       await service.purgeStoryRange(story.id, from, to)
       return `已删除 ${from.toISOString()} 至 ${to.toISOString()} 范围内的剧本和关联记忆；Canon 与参与者身份未删除。`
     })
+}
+
+async function askConfirmation(session: Session, message: string) {
+  await session.send(`${message}\n请在 60 秒内回复 y 或 n。`)
+  const answer = await session.prompt(60_000)
+  return /^(?:y|yes)$/i.test(String(answer ?? '').trim())
 }
 
 async function requireStory(service: InterludeService, session: Session) {

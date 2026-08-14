@@ -52,6 +52,11 @@ export interface StoryAutomationState {
   nextAdvanceAt?: string
   lastAutoAdvanceAt?: string
   lastUserMessageAt?: string
+  /** Short continuity passes scheduled from the latest conversation endpoint. */
+  conversationFollowUpAt?: string[]
+  /** Relationship branch whose recent conversation supplies the 10/20-minute
+   * continuity context. Omitted for ordinary background advancement. */
+  conversationFollowUpParticipantId?: string
 }
 
 export interface StorySettingOverlay {
@@ -208,6 +213,26 @@ export interface NarrativeIntent {
   updatedAt: Date
 }
 
+/** A bounded, read-only observation collected through Koishi Puppeteer.
+ * Web pages are untrusted source material: only the extracted text below is
+ * sent back to the narrator, never page HTML, scripts, cookies, or actions. */
+export interface WebObservation {
+  id: number
+  storyId: string
+  /** Empty means a world-level observation; otherwise it belongs to one relationship. */
+  participantId: string
+  intentId: number | null
+  mode: 'search' | 'visit'
+  query: string
+  url: string
+  title: string
+  excerpt: string
+  summary: string
+  status: 'success' | 'failed' | 'blocked' | 'deleted'
+  accessedAt: Date
+  createdAt: Date
+}
+
 export interface ScriptEntryDraft {
   kind: string
   actor?: string
@@ -218,7 +243,26 @@ export interface ScriptEntryDraft {
 
 export interface MemoryDraft { category: string; content: string; importance?: number; participantId?: string }
 export interface IntentDraft { type: string; summary: string; notBefore: string; payload?: Record<string, unknown>; participantId?: string }
+/** A narrator may close an active narrative consequence once the script has
+ * naturally absorbed it. Scheduled intents complete through their due-turn
+ * path, so this is deliberately limited to existing persistent context. */
+export interface IntentUpdateDraft {
+  id: number
+  status: 'completed' | 'cancelled'
+  resolution?: string
+}
 export interface OutgoingMessageDraft { participantId: string; content: string }
+
+/** A future browsing action proposed by the narrator. It is not an observed
+ * fact until Puppeteer finishes and produces a WebObservation. */
+export interface BrowserIntentDraft {
+  mode: 'search' | 'visit'
+  query?: string
+  url?: string
+  purpose: string
+  timing?: 'deferred' | 'immediate'
+  participantId?: string
+}
 
 /** A message to another relationship branch generated in the same writing turn. */
 export interface ConversationActionDraft {
@@ -244,17 +288,23 @@ export interface NarrativeDecision {
   script?: string
   /** The machine-readable result placed after the prose. */
   interaction?: NarrativeInteraction
-  entries?: ScriptEntryDraft[]
   memories?: MemoryDraft[]
   intents?: IntentDraft[]
-  messages?: OutgoingMessageDraft[]
+  /** Resolves existing active-consequence intents visible in this turn. */
+  intentUpdates?: IntentUpdateDraft[]
+  browserIntents?: BrowserIntentDraft[]
   /** Applies to the current participant only; world state uses compaction proposals. */
   statePatch?: Partial<ParticipantState>
   /** Optional outbound actions aimed at other accounts in the same main story. */
   crossConversationActions?: ConversationActionDraft[]
+  /** Optional visible reply to the configured OneBot group that caused this turn. */
+  groupReply?: {
+    mode: 'none' | 'immediate'
+    content?: string
+  }
 }
 
-export type NarrativePhase = 'advance' | 'user-message' | 'intent-due'
+export type NarrativePhase = 'advance' | 'conversation-follow-up' | 'user-message' | 'intent-due'
 
 export interface NarrativeRequest {
   /** 主模型只读取经过预算控制的连续性包，不读取完整历史。 */
@@ -270,14 +320,65 @@ export interface NarrativeRequest {
   /** Sensitive details of other participants are opt-in because the model may be remote. */
   shareParticipantDetails: boolean
   dueIntents: NarrativeIntent[]
+  /** Consequences already in motion. They are context, never newly due events. */
+  activeConsequences: NarrativeIntent[]
   supersededIntents: NarrativeIntent[]
   recentEntries: ScriptEntry[]
   memories: NarrativeMemory[]
   sceneContext?: SceneContext
   facts?: NarrativeFact[]
+  /** Recent, safety-filtered web observations available as narrative context. */
+  webContext?: WebObservation[]
+  /** Present only for a group-scene turn; private-message privacy remains unchanged. */
+  groupContext?: GroupContext
 }
 
-export interface NarrativeProvider { decide(request: NarrativeRequest): Promise<NarrativeDecision> }
+export interface GroupMessageContext {
+  senderId: string
+  senderName: string
+  content: string
+  occurredAt: Date
+  direction?: 'user' | 'character'
+}
+
+export interface GroupContext {
+  groupId: string
+  channelId: string
+  label: string
+  purpose: string
+  characterRole: string
+  messages: GroupMessageContext[]
+  gateKind?: string
+  gateReason?: string
+  gateSummary?: string
+  targetUserId?: string
+}
+
+export interface GroupGateRequest {
+  groupId: string
+  label: string
+  purpose: string
+  characterRole: string
+  /** Optional for compatibility with custom group gates written before 0.1.1-beta. */
+  responseMode?: 'mention-only' | 'selective' | 'active'
+  messages: GroupMessageContext[]
+  botUserId: string
+}
+
+export interface GroupGateDecision {
+  shouldConsiderReply: boolean
+  score: number
+  kind: string
+  reason: string
+  contextSummary: string
+  targetUserId?: string
+}
+
+export interface NarrativeProvider {
+  decide(request: NarrativeRequest): Promise<NarrativeDecision>
+  /** Optional low-cost prefilter used only for configured group chats. */
+  gateGroup?(request: GroupGateRequest): Promise<GroupGateDecision>
+}
 
 export const emptyStorySetting = (): StorySetting => ({
   character: { name: 'Unnamed character', profile: '' },
