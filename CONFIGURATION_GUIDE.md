@@ -75,7 +75,13 @@ Console 只显示字段的操作摘要；本文件补充字段语义、约束、
 - `threshold`：最低通过分数。默认 `0.65`；数值较低会提高回复频率，数值较高会降低回复频率。
 - `prompt`：追加给快速判断器的群聊规则，例如主角更常回应哪些话题。
 
-### 2.6 `onebot.groupChats`：群聊白名单与群设定
+### 2.6 `model.vision`：原生识图
+
+将 `enabled` 打开后，OneBot/NapCat 私聊中的结构化图片会和同一轮文字合并发送给主叙事模型。这里使用 OpenAI-compatible 的原生多模态输入，不调用额外图片描述模型，也不会把图片 Base64 写入剧本或记忆。
+
+所选主模型必须支持视觉输入。OneBot/NapCat 图片会优先通过当前机器人账号的 `get_image` 获取真实图片地址，因此电脑端 JPG、本地文件标识和手机端图片都走同一条路径；读取失败、非图片响应或超过 4 MiB 的图片会被忽略，文字回合继续执行。GIF、动态 WebP 和 APNG 在启用 Puppeteer 时会先截取代表帧，再作为 PNG 输入；没有 Puppeteer 时保留原始图片输入，不会生成图片描述文字。图片内容会发送给你配置的模型服务商，请按服务商隐私政策进行测试。
+
+### 2.7 `onebot.groupChats`：群聊白名单与群设定
 
 每一行对应一个允许 HDSI 参与的 QQ 群。它独立于 `onebot.userAccounts`：群成员会以 QQ 号和群名片被识别，但不会因此获得私聊授权。
 
@@ -89,7 +95,7 @@ Console 只显示字段的操作摘要；本文件补充字段语义、约束、
 
 群聊原文默认不进入私聊主模型上下文。它会以共享剧本事件保存，并可在后续记忆整理中提取为非逐字的事件影响。
 
-### 2.7 model.mainPrompt、model.formatPrompt、model.fixedPrompt 与 model.stylePrompt
+### 2.8 model.mainPrompt、model.formatPrompt、model.fixedPrompt 与 model.stylePrompt
 
 `mainPrompt` 是主叙事提示词，决定模型如何持续写作、推进剧本、处理关系和用户事件。可在此填写完整的创作要求。
 
@@ -99,7 +105,7 @@ Console 只显示字段的操作摘要；本文件补充字段语义、约束、
 
 `stylePrompt` 是默认文风提示词，只影响剧本文字的写法。角色专属文风仍然建议写在 `storyDefaults.style`。
 
-### 2.8 model.compaction
+### 2.9 model.compaction
 
 压缩模型负责将较早的剧本整理为场景摘要、长期事实和状态变化提案。它在后台运行，不占用当前私聊的主模型等待路径。
 
@@ -117,7 +123,7 @@ Console 只显示字段的操作摘要；本文件补充字段语义、约束、
 | `fixedPrompt` | 只给压缩模型看的额外规则，例如“承诺和未解决事项必须保留”。 |
 | `stylePrompt` | 压缩摘要的写法，建议简短、客观、按时间顺序。 |
 
-### 2.9 model.embedding
+### 2.10 model.embedding
 
 向量模型用于按当前消息的语义检索相关旧事实。它是可选增强项，首次启动可不配置。
 
@@ -132,7 +138,7 @@ Console 只显示字段的操作摘要；本文件补充字段语义、约束、
 | `maxInputCharacters` | 每次拿去做语义理解的文字上限。 |
 | `backfillBatchSize` | 后台每次给多少条旧事实补向量。`0` 表示不补旧历史。 |
 
-### 2.10 `browser`：Puppeteer 只读网页观察
+### 2.11 `browser`：Puppeteer 只读网页观察
 
 这是可选能力。除了启用本插件的 `browser.enabled`，还必须在 Koishi 中安装并启用官方 `koishi-plugin-puppeteer`；未安装浏览器服务时 HDSI 会把浏览任务记录为失败观察，但不会影响正常私聊、群聊、记忆或自动推进。
 
@@ -212,7 +218,8 @@ Console 只显示字段的操作摘要；本文件补充字段语义、约束、
 | `captureDirectMessages` | 是否接管私聊。关闭后已有故事也不会自动处理新私聊。 |
 | `autoCreate` | 新私聊是否自动建故事。关闭时测试员需要先发 `interlude.init`。 |
 | `ignoreCommandMessages` | 是否把 `interlude.*` 命令排除在剧情外。建议开启。 |
-| `allowProactiveMessages` | 是否允许角色在用户没有新消息时主动发可见消息。首次测试建议关闭。 |
+| `allowProactiveMessages` | 是否允许角色在用户没有新消息时主动发可见消息。开启后由主模型在每次自动推进中为每个候选动作输出 `willingness`（0~1）和 `reason`，不是按固定冷却或随机概率发送。 |
+| `proactiveWillingnessThreshold` | 主动联系意愿门槛，默认 `0.65`。低于门槛的候选不投递；调低会更主动，调高会更克制。 |
 | `sweepIntervalMinutes` | 后台检查延迟回复和自动推进的间隔；检查本身不一定调用模型。 |
 | `minimumAdvanceMinutes` | 旧版兼容项，通常不用改。 |
 | `maxStoriesPerSweep` | 每轮后台最多处理多少个故事。 |
@@ -258,9 +265,12 @@ Console 只显示字段的操作摘要；本文件补充字段语义、约束、
 | `sceneCharacterThreshold` | 当前场景累计多少字后触发整理。条数和字数满足任一条件即可。 |
 | `recentEntryLimit` | 主模型保留多少条最近完整剧本。 |
 | `factLimit` | 主模型每次最多带入多少条长期事实。 |
-| `statePatchConfidenceThreshold` | 普通人物、关系、世界变化自动生效所需置信度。 |
+| `statePatchConfidenceThreshold` | 普通人物、关系、世界变化自动生效所需置信度；不足时只保留候选。 |
 | `majorStatePatchConfidenceThreshold` | 重大变化自动生效所需置信度。建议保持较高。 |
-| `statePatchMinEvidence` | 普通变化至少需要多少条剧本证据。 |
+| `statePatchMinEvidence` | 兼容旧配置的证据回合数下限。运行时不会低于 3，不再按一次压缩中的记录条数直接应用。 |
+| `statePatchMinTurns` | 普通变化至少需要来自多少个不同剧本回合。默认 `3`。 |
+| `statePatchMinDays` | 普通变化至少跨越多少个日历日。默认 `2`。重大变化不受此项限制。 |
+| `statePatchCooldownHours` | 同一目标路径应用长期变化后的冷却时间。默认 `72` 小时。 |
 | `maxFactsPerStory` | 单个故事最多保存多少条长期事实。 |
 | `maxStoriesPerCompactionRun` | 每轮后台最多整理多少个故事。 |
 | `compactionEntryLimit` | 单次整理最多读取多少条原始剧本。 |
@@ -276,6 +286,25 @@ Console 只显示字段的操作摘要；本文件补充字段语义、约束、
 | `unresolvedWeight` | 未完成承诺、未解决问题的额外权重。 |
 | `autoApplyStatePatches` | 达到门槛后是否自动应用人物、关系或世界变化。 |
 | `allowMajorStateChanges` | 是否允许重大变化自动生效。关闭后重大变化只保存为提案。 |
+
+### 6.4 overlay 的生命周期
+
+overlay 只表示经过长期证据确认的稳定变化，不记录一次聊天中的临时情绪。状态提案按以下流程处理：
+
+```text
+proposed → applied → compacted
+             │
+             └→ cleared（管理员清理后）
+```
+
+普通变化需要至少 3 个不同剧本回合、跨越至少 2 个日历日，并受到同一路径冷却限制。近期关系变化由剧本、`relationshipNotes`、剧情余波和低频连续性快照承载；这些内容不会立即改写 canon 或稳定 overlay。
+
+相关指令：
+
+- `interlude.overlay.status`：查看当前 overlay、候选提案和压缩快照数量。
+- `interlude.overlay.compact`：只合并/压缩已应用 overlay。
+- `interlude.overlay.clear character|relationship|world|all`：清理对应 overlay，并同时使相关候选提案失效。
+- `interlude.compact`：完整整理剧本、事实、状态提案，并顺带执行 overlay 维护。
 
 ## 7. onebot：NapCat / OneBot QQ 账号控制
 

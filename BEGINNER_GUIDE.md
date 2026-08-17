@@ -27,7 +27,7 @@ interlude.init 主角名字
 
 ## 建议测试顺序
 
-1. 先关闭 `runtime.allowProactiveMessages`、Embedding 和网页浏览，只验证私聊回复。
+1. 先关闭 `runtime.allowProactiveMessages`、Embedding 和网页浏览，只验证私聊回复。确认角色的日常推进稳定后，再开启主动联系；主动联系由主模型逐次给出意愿值，不使用机械冷却。
 2. 在两秒内发送多条短消息，确认它们只产生一次主模型写作回合。
 3. 测试延迟回复：用户再次发言后，旧延迟计划应取消并重新判断。
 4. 开启 `runtime.autoAdvanceEnabled`，使用 `interlude.advance` 检查自动回合的剧本和消息行为。
@@ -54,6 +54,10 @@ interlude.init 主角名字
 - `interlude.timeline`：查看当前账号相关的近期剧本条目。
 - `interlude.memory.intents`：查看延迟回复、提醒、承诺和剧情余波。
 - `interlude.pause` / `interlude.resume`：暂停或恢复后台处理。
-- `interlude.overlay.clear character|relationship|world`：清理指定类型的设定演化覆盖层；执行后按提示确认。
+- `interlude.overlay.status`：查看当前 overlay、待积累提案和压缩快照。
+- `interlude.overlay.compact`：只合并/压缩已经应用的 overlay。
+- `interlude.overlay.clear character|relationship|world|all`：清理指定类型的设定演化覆盖层；执行后按提示确认，同时会使相关待积累候选失效。
+
+overlay 不会因为一次聊天就改变人格。普通变化需要多个剧本回合和不同日期的证据；近期情绪和关系变化会先留在剧本、关系笔记或剧情余波中。只有稳定变化才会进入长期 overlay。
 
 完整配置说明见 `CONFIGURATION_GUIDE.md`，管理员指令说明见 `command.md`。

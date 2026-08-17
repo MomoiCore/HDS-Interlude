@@ -1,6 +1,6 @@
 import { Context, Service, Session } from 'koishi';
 import { ModelConfig } from './narrator';
-import { InterludeArc, InterludeScene, InterludeParticipant, InterludeStory, NarrativeFact, NarrativeIntent, NarrativeProvider, NarrativeCompactor, NarrativeEmbedder, OutgoingMessageDraft, ScriptEntry, StorySetting, StoryState } from './types';
+import { InterludeArc, InterludeScene, InterludeParticipant, InterludeStory, NarrativeFact, NarrativeIntent, NarrativeProvider, NarrativeCompactor, NarrativeEmbedder, OutgoingMessageDraft, StatePatchProposal, StorySetting, StoryState, OverlaySnapshot } from './types';
 export interface Config {
     model: ModelConfig;
     runtime: RuntimeConfig;
@@ -70,15 +70,38 @@ export interface MemoryConfig {
     statePatchConfidenceThreshold: number;
     majorStatePatchConfidenceThreshold: number;
     statePatchMinEvidence: number;
+    /** Minimum independent narrative turns for a minor overlay change. */
+    statePatchMinTurns?: number;
+    /** Minimum distinct calendar days represented by minor-patch evidence. */
+    statePatchMinDays?: number;
+    /** Cooldown between stable overlay changes on the same target/path. */
+    statePatchCooldownHours?: number;
     autoApplyStatePatches: boolean;
     allowMajorStateChanges: boolean;
     maxFactsPerStory: number;
+    /** Keep short-lived dramatic aftereffects as context for later writing. */
+    activeConsequencesEnabled: boolean;
+    /** Maximum active consequences carried into one main-narrative prompt. */
+    activeConsequencePromptLimit: number;
+    /** Longest permitted lifetime of one consequence; protects canon from drift. */
+    activeConsequenceMaxDays: number;
+    /** Used when the narrator omits a precise strength for a valid consequence. */
+    activeConsequenceDefaultStrength: number;
+    overlayCompressionEnabled?: boolean;
+    overlayRecentDays?: number;
+    overlayMonthlyAfterDays?: number;
+    overlayWeeklyWindowDays?: number;
+    overlayMonthlyWindowDays?: number;
+    overlayWeeklySummaryCharacters?: number;
+    overlayMonthlySummaryCharacters?: number;
 }
 export interface RuntimeConfig {
     captureDirectMessages: boolean;
     autoCreate: boolean;
     ignoreCommandMessages: boolean;
     allowProactiveMessages: boolean;
+    /** Minimum narrator-declared willingness for a background-initiated contact. */
+    proactiveWillingnessThreshold?: number;
     sweepIntervalMinutes: number;
     minimumAdvanceMinutes: number;
     maxStoriesPerSweep: number;
@@ -107,6 +130,10 @@ export interface RuntimeConfig {
     autoAdvanceEnabled?: boolean;
     autoAdvanceIntervalMinutes?: number;
     autoAdvanceJitterMinutes?: number;
+    /** Short life-writing passes after a conversation, in minutes. */
+    conversationFollowUpMinutes?: number[];
+    /** Small random offset applied to each short conversation follow-up. */
+    conversationFollowUpJitterMinutes?: number;
     pauseAfterConversationMinutes?: number;
     restWindows?: RestWindow[];
 }
@@ -180,6 +207,8 @@ export interface StoryDefaults {
 }
 export interface LoggingConfig {
     level: 'silent' | 'error' | 'warn' | 'info' | 'debug';
+    /** Controls how much normal operational activity is written at info level. */
+    verbosity?: 'summary' | 'standard' | 'diagnostic';
     format: 'compact' | 'detailed';
     logScriptPreview: boolean;
     /** Emit user-visible incoming/outgoing message bodies to the plugin log. */
@@ -199,6 +228,8 @@ export declare class InterludeService extends Service {
     private queues;
     private bufferedNarrativeTurns;
     private bufferedGroupTurns;
+    /** Earliest wake-up for persisted typing segments; one timer per story. */
+    private dueIntentWakeTimers;
     /** Prevent a background life turn from racing an unlocked live model call. */
     private narratingStories;
     private factBackfills;
@@ -238,18 +269,22 @@ export declare class InterludeService extends Service {
     canManageSession(session: Session): boolean;
     /** Background life updates only require the bot account to remain enabled. */
     canHandleStory(story: InterludeStory): boolean;
-    findStory(session: Session): Promise<InterludeStory>;
+    findStory(session: Session): Promise<any>;
     /**
      * Resolve and enforce the one global active story. The preferred id wins
      * when present; otherwise the most recently updated row is retained and
      * every other active row is archived immediately.
      */
     private getCanonicalStory;
-    findParticipant(session: Session, story?: InterludeStory): Promise<InterludeParticipant>;
-    participants(storyId: string, includePaused?: boolean): Promise<InterludeParticipant[]>;
-    createStory(session: Session, name?: string): Promise<InterludeStory>;
-    /** Enrolls a QQ account as a relationship branch and refreshes its channel. */
-    ensureParticipant(story: InterludeStory, session: Session, now?: Date): Promise<InterludeParticipant>;
+    findParticipant(session: Session, story?: InterludeStory): Promise<any>;
+    participants(storyId: string, includePaused?: boolean): Promise<any[]>;
+    createStory(session: Session, name?: string): Promise<any>;
+    /**
+     * Enrolls a QQ account as a relationship branch and synchronizes its Console
+     * identity fields. Callers that already resolved the participant can pass it
+     * in to avoid a second database read.
+     */
+    ensureParticipant(story: InterludeStory, session: Session, now?: Date, knownExisting?: InterludeParticipant): Promise<any>;
     updateSetting(story: InterludeStory, patch: Partial<StorySetting>): Promise<{
         setting: StorySetting;
         updatedAt: Date;
@@ -276,12 +311,12 @@ export declare class InterludeService extends Service {
         cursorAt: Date;
         createdAt: Date;
     }>;
-    recentEntries(storyId: string, limit?: number): Promise<import("minato").FlatPick<ScriptEntry, any>[]>;
-    memories(storyId: string, limit?: number, participantId?: string): Promise<import("minato").FlatPick<import("./types").NarrativeMemory, any>[]>;
+    recentEntries(storyId: string, limit?: number): Promise<any[]>;
+    memories(storyId: string, limit?: number, participantId?: string): Promise<any[]>;
     /** Administrative view: includes global and participant-specific durable facts. */
     adminFacts(storyId: string, limit?: number): Promise<import("minato").FlatPick<NarrativeFact, any>[]>;
     adminPendingIntents(storyId: string, limit?: number): Promise<import("minato").FlatPick<NarrativeIntent, any>[]>;
-    adminStatePatches(storyId: string, limit?: number): Promise<import("minato").FlatPick<import("./types").StatePatchProposal, any>[]>;
+    adminStatePatches(storyId: string, limit?: number): Promise<import("minato").FlatPick<StatePatchProposal, any>[]>;
     /** Adds an audit-visible system note without pretending it came from the model. */
     addAdminScriptNote(story: InterludeStory, content: string): Promise<boolean>;
     /** Adds a high-confidence fact for corrections that must survive compaction. */
@@ -331,6 +366,16 @@ export declare class InterludeService extends Service {
      * makes “你好 / 在吗 / 我有件事想问” one event without risking message loss.
      */
     private bufferUserNarrative;
+    /** Extract structured image segments without treating them as a second event. */
+    private describeVisionEvent;
+    private loadNativeImages;
+    private fetchNativeImage;
+    /** Convert adapter/fetched bytes into one bounded native-vision attachment.
+     * Animated stickers are rendered to a representative PNG frame when the
+     * optional Puppeteer service is available; otherwise the original image is
+     * still passed through rather than inventing a description. */
+    private imageBytesToNative;
+    private renderAnimatedImageFrame;
     /** Prevent timers or already-returning model calls from resurrecting data
      * after an administrator resets the story or clears HDSI tables. */
     private invalidateBufferedNarratives;
@@ -341,9 +386,24 @@ export declare class InterludeService extends Service {
     /** Used by commands/tests to deliver a mixed set of account-targeted actions safely. */
     deliverMessages(story: InterludeStory, messages: OutgoingMessageDraft[], session?: Session): Promise<void>;
     compactStory(story: InterludeStory, force?: boolean): Promise<boolean>;
+    /** Merge and compress already-applied overlay patches without running the
+     * full scene/fact compaction pass. This is safe for manual maintenance. */
+    compactOverlay(story: InterludeStory): Promise<boolean>;
+    /** Administrative overlay view used by the Console command. */
+    adminOverlayStatus(storyId: string): Promise<{
+        state: any;
+        proposed: StatePatchProposal[];
+        applied: StatePatchProposal[];
+        cleared: StatePatchProposal[];
+        snapshots: OverlaySnapshot[];
+        participantOverlays: any[];
+    }>;
     sweep(): Promise<void>;
     private advanceUnlocked;
     private decide;
+    /** Refresh continuity only on the first automatic pass or every fifteenth
+     * successful narrative write. Ordinary turns reuse the last snapshot. */
+    private shouldRefreshContinuity;
     private tryDecide;
     private persistDecision;
     private appendEntry;
@@ -354,7 +414,7 @@ export declare class InterludeService extends Service {
      * signals instead of replacing them; a failed vector lookup simply has a
      * semantic score of zero for this turn.
      */
-    facts(storyId: string, limit?: number, query?: string, participantId?: string): Promise<import("minato").FlatPick<NarrativeFact, any>[]>;
+    facts(storyId: string, limit?: number, query?: string, participantId?: string): Promise<any[]>;
     /** Returns only observations that are safe for this narration branch. A
      * participant's browsing is not shown to another private participant unless
      * the owner has explicitly enabled shared relationship details. */
@@ -362,6 +422,14 @@ export declare class InterludeService extends Service {
     activeScene(storyId: string): Promise<InterludeScene | null>;
     activeArc(storyId: string): Promise<InterludeArc | null>;
     private appendIntent;
+    /** Active consequences share the intent table but are never scheduler work.
+     * Their payload keeps the lifecycle explicit so old scheduled intents keep
+     * their existing behaviour without a migration. */
+    private activeConsequences;
+    private expireActiveConsequences;
+    /** Only active consequences visible to the writer may be resolved. This
+     * prevents a remote model from changing arbitrary future plans by id. */
+    private applyIntentUpdates;
     /** Stores a narrator-proposed browser action as a future intent. The model
      * never writes page content directly; a separate Puppeteer task creates the
      * observation later. */
@@ -385,6 +453,12 @@ export declare class InterludeService extends Service {
     /** Persist a bounded retry so a transient provider failure cannot strand a user turn. */
     private scheduleNarrativeRetry;
     private dueIntents;
+    /** Wake the scheduler close to a short typing delay instead of waiting for
+     * the normal background sweep. The due intent remains the source of truth. */
+    private scheduleDueIntentWake;
+    private scheduleNextSplitWake;
+    /** Deliver already-decided <sep/> segments without invoking the narrator. */
+    private deliverDueSplitSegments;
     private cancelPendingOutgoingMessages;
     private sendScheduledMessages;
     /**
@@ -396,17 +470,24 @@ export declare class InterludeService extends Service {
     private sendOutgoingMessages;
     private splitOutgoingMessage;
     private typingDelayMilliseconds;
-    /** Deliver a separated chat bubble without blocking the next narrative turn. */
-    private deliverSegment;
     private findBotForParticipant;
     private get autoAdvanceConfig();
     private isAutomaticAdvancePaused;
+    private dueConversationFollowUps;
+    /** Remove elapsed short passes after their single writing turn. The next
+     * remaining pass stays persisted, so reloads never restart the 10/20-minute
+     * sequence or accidentally run both passes at once. */
+    private completeConversationFollowUps;
     private isAutomaticAdvanceDue;
     private pauseAutomaticAdvanceAfterUserMessage;
     private pauseAutomaticAdvanceAfterDelayedReply;
-    private pauseAutomaticAdvance;
+    /** Schedule the 10/20-minute continuity passes from the actual endpoint of
+     * a conversation. A delayed reply anchors them after its planned send time. */
+    private scheduleConversationFollowUpsAfterTurn;
     private scheduleNextAutomaticAdvance;
     private get sharedStoryConfig();
+    private mainModelLabel;
+    private groupGateModelLabel;
     private participantPreset;
     /** The clean Canon used both by story creation and a full administrative reset. */
     private initialStorySetting;
@@ -433,6 +514,14 @@ export declare class InterludeService extends Service {
     private scheduleCompaction;
     private compactStories;
     private compactUnlocked;
+    /** Older state patches are compacted only by the background maintenance
+     * lane. Live turns always retain the last few days as raw detail. */
+    private compactOverlayUnlocked;
+    private overlaySnapshotsForPrompt;
+    /** Once a snapshot safely represents older changes, keep state.overlay as
+     * the live (uncompacted) delta only. This is what actually reduces prompt
+     * size; snapshots carry the older evolution separately. */
+    private rebuildLiveOverlayState;
     private persistCompaction;
     private persistFact;
     private embedText;
@@ -440,12 +529,28 @@ export declare class InterludeService extends Service {
     private backfillFactEmbeddings;
     private persistStatePatch;
     private report;
+    /** Emit an operational record only when the selected verbosity includes it.
+     * Summary is for outcomes, standard is for scheduler/model activity, and
+     * diagnostic is for skip reasons and internal counters. */
+    private reportOperation;
+    private writeReport;
     private reportStandalone;
+    private reportStandaloneOperation;
+    private writeStandalone;
+    private allowsVerbosity;
     private getStory;
     private serial;
     private dbWrite;
+    /**
+     * A SQLite/sql.js read can fail during the same short filesystem hiccup as a
+     * write. Reads stay concurrent for normal performance; only transient driver
+     * errors receive a small bounded retry instead of aborting a user turn.
+     */
+    private dbRead;
+    private dbGet;
     private retryDbWrite;
     private dbCreate;
+    private findPossiblyCommittedCreate;
     private dbSet;
     private dbRemove;
     /**

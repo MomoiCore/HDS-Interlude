@@ -1,5 +1,5 @@
 import { Context } from 'koishi';
-import { InterludeArc, InterludeParticipant, InterludeScene, InterludeStory, NarrativeFact, NarrativeIntent, NarrativeMemory, ScriptEntry, StatePatchProposal, WebObservation } from './types';
+import { InterludeArc, InterludeParticipant, InterludeScene, InterludeStory, NarrativeFact, NarrativeIntent, NarrativeMemory, OverlaySnapshot, ScriptEntry, StatePatchProposal, WebObservation } from './types';
 declare module 'koishi' {
     interface Tables {
         interlude_story: InterludeStory;
@@ -11,6 +11,7 @@ declare module 'koishi' {
         interlude_arc: InterludeArc;
         interlude_fact: NarrativeFact;
         interlude_state_patch: StatePatchProposal;
+        interlude_overlay_snapshot: OverlaySnapshot;
         interlude_web_observation: WebObservation;
     }
 }

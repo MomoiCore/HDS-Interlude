@@ -25,8 +25,20 @@ export interface StoryState {
   settingOverlay: StorySettingOverlay
   activeSceneId?: number
   activeArcId?: number
+  /** Low-frequency continuity note refreshed on the first auto pass and then after every 15 successful narrative updates. */
+  continuitySnapshot?: ContinuitySnapshot
+  narrativeUpdateCount: number
+  lastContinuityUpdateAt?: string
   /** 自动推进时钟；ISO 字符串便于跨进程/数据库 JSON 持久化。 */
   automation: StoryAutomationState
+}
+
+/** Compact replace-in-place reminder of the protagonist's current state and notable threads. */
+export interface ContinuitySnapshot {
+  current: string
+  next: string[]
+  recent: string[]
+  salient: string[]
 }
 
 /**
@@ -157,7 +169,7 @@ export interface InterludeArc {
 }
 
 export type StatePatchTarget = 'character' | 'world' | 'relationship'
-export type StatePatchStatus = 'proposed' | 'applied' | 'rejected'
+export type StatePatchStatus = 'proposed' | 'applied' | 'compacted' | 'rejected' | 'cleared'
 
 export interface StatePatchProposal {
   /**
@@ -177,6 +189,26 @@ export interface StatePatchProposal {
   sourceEntryIds: number[]
   createdAt: Date
   appliedAt: Date | null
+}
+
+/** A compressed, auditable layer of setting evolution. Raw applied patches
+ * remain intact and are only marked compacted after a snapshot is stored. */
+export interface OverlaySnapshot {
+  id: number
+  storyId: string
+  participantId: string
+  target: StatePatchTarget
+  /** Kept as weekly/monthly for database compatibility; runtime windows are
+   * five days and ten days respectively. */
+  tier: 'weekly' | 'monthly'
+  periodStart: Date
+  periodEnd: Date
+  summary: string
+  majorEvents: string[]
+  sourcePatchIds: number[]
+  status: 'active' | 'superseded'
+  createdAt: Date
+  updatedAt: Date
 }
 
 export interface NarrativeFact {
@@ -270,6 +302,10 @@ export interface ConversationActionDraft {
   mode: 'immediate' | 'delayed'
   content: string
   sendAt?: string
+  /** 0..1: how strongly the protagonist actually wants to initiate contact now. */
+  willingness?: number
+  /** Short audit note explaining the concrete reason for this contact. */
+  reason?: string
 }
 
 export type InteractionReplyMode = 'none' | 'immediate' | 'delayed'
@@ -286,6 +322,8 @@ export interface NarrativeInteraction {
 export interface NarrativeDecision {
   /** The continuous prose written by the main narrative model. */
   script?: string
+  /** Present only when the request explicitly asks for a low-frequency continuity refresh. */
+  continuity?: ContinuitySnapshot
   /** The machine-readable result placed after the prose. */
   interaction?: NarrativeInteraction
   memories?: MemoryDraft[]
@@ -306,13 +344,25 @@ export interface NarrativeDecision {
 
 export type NarrativePhase = 'advance' | 'conversation-follow-up' | 'user-message' | 'intent-due'
 
+/** A transient native-vision attachment for the current private-message turn.
+ * It is intentionally never persisted in script entries, memories, or facts. */
+export interface NarrativeImage {
+  id: string
+  mimeType: string
+  dataUri: string
+}
+
 export interface NarrativeRequest {
   /** 主模型只读取经过预算控制的连续性包，不读取完整历史。 */
   phase: NarrativePhase
+  /** Refresh the compact continuity note on this turn. */
+  refreshContinuity?: boolean
   story: InterludeStory
   from: Date
   now: Date
   userMessage?: string
+  /** Native image inputs observed in this one incoming user event only. */
+  images?: NarrativeImage[]
   /** The relationship that caused this turn; null for unattended life updates. */
   participant: InterludeParticipant | null
   /** Other currently enrolled relationship branches, ordered by relevance. */
@@ -327,6 +377,8 @@ export interface NarrativeRequest {
   memories: NarrativeMemory[]
   sceneContext?: SceneContext
   facts?: NarrativeFact[]
+  /** Older setting evolution, separated from the live three-day overlay. */
+  overlaySnapshots?: OverlaySnapshot[]
   /** Recent, safety-filtered web observations available as narrative context. */
   webContext?: WebObservation[]
   /** Present only for a group-scene turn; private-message privacy remains unchanged. */
@@ -388,7 +440,7 @@ export const emptyStorySetting = (): StorySetting => ({
   timezone: 'Asia/Shanghai',
 })
 
-export const emptyStoryState = (): StoryState => ({ settingOverlay: { characterTraits: [] }, automation: {} })
+export const emptyStoryState = (): StoryState => ({ settingOverlay: { characterTraits: [] }, automation: {}, narrativeUpdateCount: 0 })
 
 export const emptyParticipantState = (): ParticipantState => ({
   openThreads: [], relationshipNotes: [], unreadMessageCount: 0, pendingReplyCount: 0,
@@ -442,8 +494,25 @@ export interface CompactionDecision {
   statePatches?: StatePatchDraft[]
 }
 
+export interface OverlayCompactionRequest {
+  story: InterludeStory
+  participant?: InterludeParticipant
+  target: StatePatchTarget
+  tier: OverlaySnapshot['tier']
+  from: Date
+  to: Date
+  patches: StatePatchProposal[]
+  snapshots?: OverlaySnapshot[]
+}
+
+export interface OverlayCompactionDecision {
+  summary: string
+  majorEvents?: string[]
+}
+
 export interface NarrativeCompactor {
   compact(request: CompactionRequest): Promise<CompactionDecision>
+  compactOverlay(request: OverlayCompactionRequest): Promise<OverlayCompactionDecision>
 }
 
 export interface NarrativeEmbedder {

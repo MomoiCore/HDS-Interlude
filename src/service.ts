@@ -1,13 +1,22 @@
-import { Context, Logger, Service, Session, Time } from 'koishi'
+import { Context, h, Logger, Service, Session, Time } from 'koishi'
 import { registerTables } from './database'
+import { readFile } from 'node:fs/promises'
 import { createCompactor, createEmbedder, createNarrator, ModelConfig } from './narrator'
 import {
   CompactionDecision, emptyStorySetting, emptyStoryState, IntentDraft, InterludeArc, InterludeScene,
   InterludeParticipant, InterludeStory, MemoryDraft, NarrativeDecision, NarrativeFact, NarrativeIntent,
   GroupContext, GroupGateDecision, GroupGateRequest, GroupMessageContext, NarrativeInteraction, NarrativeProvider, NarrativeRequest, NarrativeCompactor,
-  NarrativeEmbedder, OutgoingMessageDraft, ParticipantState, ScriptEntry, ScriptEntryDraft, StatePatchDraft, StorySetting, StoryState,
-  BrowserIntentDraft, WebObservation, emptyParticipantState,
+  ContinuitySnapshot, NarrativeEmbedder, OutgoingMessageDraft, ParticipantState, ScriptEntry, ScriptEntryDraft, StatePatchDraft, StatePatchProposal, StorySetting, StoryState,
+  BrowserIntentDraft, NarrativeImage, OverlaySnapshot, WebObservation, emptyParticipantState,
 } from './types'
+
+// Only QQ/OneBot CDN hosts are fetched in the native-vision path. This keeps
+// arbitrary user-provided URLs from becoming an internal-network fetch proxy.
+function isTrustedImageHost(hostname: string) {
+  const host = hostname.toLowerCase().replace(/\.$/, '')
+  const allowed = ['gchat.qpic.cn', 'c2cpicdw.qpic.cn', 'multimedia.nt.qq.com.cn', 'thirdqq.qlogo.cn', 'q.qlogo.cn']
+  return allowed.some(domain => host === domain || host.endsWith(`.${domain}`))
+}
 
 export interface Config {
   model: ModelConfig
@@ -82,6 +91,12 @@ export interface MemoryConfig {
   statePatchConfidenceThreshold: number
   majorStatePatchConfidenceThreshold: number
   statePatchMinEvidence: number
+  /** Minimum independent narrative turns for a minor overlay change. */
+  statePatchMinTurns?: number
+  /** Minimum distinct calendar days represented by minor-patch evidence. */
+  statePatchMinDays?: number
+  /** Cooldown between stable overlay changes on the same target/path. */
+  statePatchCooldownHours?: number
   autoApplyStatePatches: boolean
   allowMajorStateChanges: boolean
   maxFactsPerStory: number
@@ -93,6 +108,13 @@ export interface MemoryConfig {
   activeConsequenceMaxDays: number
   /** Used when the narrator omits a precise strength for a valid consequence. */
   activeConsequenceDefaultStrength: number
+  overlayCompressionEnabled?: boolean
+  overlayRecentDays?: number
+  overlayMonthlyAfterDays?: number
+  overlayWeeklyWindowDays?: number
+  overlayMonthlyWindowDays?: number
+  overlayWeeklySummaryCharacters?: number
+  overlayMonthlySummaryCharacters?: number
 }
 
 export interface RuntimeConfig {
@@ -100,6 +122,8 @@ export interface RuntimeConfig {
   autoCreate: boolean
   ignoreCommandMessages: boolean
   allowProactiveMessages: boolean
+  /** Minimum narrator-declared willingness for a background-initiated contact. */
+  proactiveWillingnessThreshold?: number
   sweepIntervalMinutes: number
   minimumAdvanceMinutes: number
   maxStoriesPerSweep: number
@@ -211,6 +235,8 @@ interface BufferedUserMessage {
   content: string
   occurredAt: Date
   supersededIntents: NarrativeIntent[]
+  /** Short-lived source links only; never written to HDSI storage. */
+  imageSources: string[]
 }
 
 /** A per-relationship input buffer. Messages are durable immediately, while
@@ -416,14 +442,14 @@ export class InterludeService extends Service {
       }
     }
     const id = legacyStoryIdFor(session.platform, session.selfId, session.userId)
-    const existing = (await this.ctx.database.get('interlude_story', { id }))[0]
+    const existing = (await this.dbGet('interlude_story', { id }))[0]
     if (existing || !this.sharedStoryConfig.enabled) return existing
 
     // Old beta versions used one story id per QQ. Migrate lazily when that QQ
     // first returns, so existing scripts become the first relationship branch
     // of the new shared story instead of silently disappearing.
     const legacyId = legacyStoryIdFor(session.platform, session.selfId, session.userId)
-    const legacy = (await this.ctx.database.get('interlude_story', { id: legacyId }))[0]
+    const legacy = (await this.dbGet('interlude_story', { id: legacyId }))[0]
     return legacy ? this.migrateLegacyStory(legacy, session) : undefined
   }
 
@@ -433,7 +459,7 @@ export class InterludeService extends Service {
    * every other active row is archived immediately.
    */
   private async getCanonicalStory(preferredId?: string) {
-    const active = await this.ctx.database.get('interlude_story', { status: 'active' }, {
+    const active = await this.dbGet('interlude_story', { status: 'active' }, {
       sort: { updatedAt: 'desc' },
     })
     if (!active.length) return undefined
@@ -457,12 +483,12 @@ export class InterludeService extends Service {
     // is being migrated, the same pair can temporarily exist under another
     // story.  The story-bound lookup prevents accidentally moving or exposing
     // the wrong relationship branch.
-    const rows = await this.ctx.database.get('interlude_participant', { storyId: resolved.id })
+    const rows = await this.dbGet('interlude_participant', { storyId: resolved.id })
     return rows.find(item => sameParticipantEndpoint(item, session))
   }
 
   async participants(storyId: string, includePaused = false) {
-    const rows = await this.ctx.database.get('interlude_participant', { storyId })
+    const rows = await this.dbGet('interlude_participant', { storyId })
     return rows
       .filter(participant => includePaused || participant.status === 'active')
       .sort((a, b) => b.updatedAt.getTime() - a.updatedAt.getTime())
@@ -507,11 +533,15 @@ export class InterludeService extends Service {
     return story
   }
 
-  /** Enrolls a QQ account as a relationship branch and refreshes its channel. */
-  async ensureParticipant(story: InterludeStory, session: Session, now = new Date()) {
+  /**
+   * Enrolls a QQ account as a relationship branch and synchronizes its Console
+   * identity fields. Callers that already resolved the participant can pass it
+   * in to avoid a second database read.
+   */
+  async ensureParticipant(story: InterludeStory, session: Session, now = new Date(), knownExisting?: InterludeParticipant) {
     const account = this.userAccountRule(session.userId)
     const preset = this.participantPreset(session.userId)
-    const existing = await this.findParticipant(session, story)
+    const existing = knownExisting ?? await this.findParticipant(session, story)
     if (existing) {
       // Console edits to the whitelist are intentional identity changes.
       // Keep relationship evolution in participant.state.relationshipOverlay;
@@ -520,10 +550,22 @@ export class InterludeService extends Service {
       const displayName = account?.label?.trim() || preset?.label?.trim() || existing.displayName || session.username || session.userId
       const profile = account?.profile?.trim() || preset?.profile?.trim() || existing.profile || this.config.storyDefaults.userProfile
       const relationship = account?.relationship?.trim() || preset?.relationship?.trim() || existing.relationship || this.config.storyDefaults.relationship
-      await this.dbSet('interlude_participant', { id: existing.id }, {
-        storyId: story.id, channelId: session.channelId, personId, displayName, profile, relationship, updatedAt: now,
-      })
-      return { ...existing, storyId: story.id, channelId: session.channelId, personId, displayName, profile, relationship, updatedAt: now }
+      const changed = existing.storyId !== story.id
+        || existing.channelId !== session.channelId
+        || existing.personId !== personId
+        || existing.displayName !== displayName
+        || existing.profile !== profile
+        || existing.relationship !== relationship
+      if (changed) {
+        await this.dbSet('interlude_participant', { id: existing.id }, {
+          storyId: story.id, channelId: session.channelId, personId, displayName, profile, relationship, updatedAt: now,
+        })
+        this.reportOperation('diagnostic', 'debug', story, 'user-message', '参与者资料已从 Console 同步 参与者=%s', existing.id)
+      }
+      return {
+        ...existing, storyId: story.id, channelId: session.channelId, personId, displayName, profile, relationship,
+        updatedAt: changed ? now : existing.updatedAt,
+      }
     }
     const baseId = participantIdFor(session.platform, session.selfId, session.userId)
     // Keep the historical id whenever it is free.  If an old per-account
@@ -575,7 +617,7 @@ export class InterludeService extends Service {
 
   async recentEntries(storyId: string, limit = this.config.runtime.contextEntryLimit) {
     const bounded = Math.max(1, Math.min(limit, 200))
-    const rows = await this.ctx.database.get('interlude_script_entry', { storyId }, {
+    const rows = await this.dbGet('interlude_script_entry', { storyId }, {
       limit: bounded,
       sort: { occurredAt: 'desc' },
     })
@@ -584,7 +626,7 @@ export class InterludeService extends Service {
 
   async memories(storyId: string, limit = this.config.runtime.memoryLimit, participantId?: string) {
     const bounded = Math.max(1, Math.min(limit * 4, 500))
-    const rows = await this.ctx.database.get('interlude_memory', { storyId, status: 'active' }, {
+    const rows = await this.dbGet('interlude_memory', { storyId, status: 'active' }, {
       limit: bounded,
       sort: { importance: 'desc', updatedAt: 'desc' },
     })
@@ -696,11 +738,18 @@ export class InterludeService extends Service {
       }
     }
 
-    // Preserve proposals for audit, but mark applied ones stale after reset.
-    const patches = await this.ctx.database.get('interlude_state_patch', { storyId: story.id, status: 'applied' })
+    // Preserve proposals for audit, but invalidate both active overlay rows and
+    // pending candidates. Otherwise a candidate created before the clear could
+    // be applied later and silently resurrect the old personality/relationship.
+    const patches = await this.ctx.database.get('interlude_state_patch', { storyId: story.id })
     for (const patch of patches) {
-      if (target !== 'all' && patch.target !== target) continue
+      if (!['proposed', 'applied', 'compacted'].includes(patch.status) || (target !== 'all' && patch.target !== target)) continue
       await this.dbSet('interlude_state_patch', { id: patch.id }, { status: 'cleared' })
+    }
+    const snapshots = await this.dbGet('interlude_overlay_snapshot', { storyId: story.id, status: 'active' }) as OverlaySnapshot[]
+    for (const snapshot of snapshots) {
+      if (target !== 'all' && snapshot.target !== target) continue
+      await this.dbSet('interlude_overlay_snapshot', { id: snapshot.id }, { status: 'superseded', updatedAt: now })
     }
     return { participantCount }
   }
@@ -721,6 +770,7 @@ export class InterludeService extends Service {
     await this.purgeTable('interlude_arc', { storyId }, { status: 'closed', summary: '', sceneCount: 0 })
     await this.purgeTable('interlude_fact', { storyId }, { status: 'superseded', content: '[管理员已删除事实]' })
     await this.purgeTable('interlude_state_patch', { storyId }, { status: 'rejected', proposedValue: '[管理员已删除提案]', evidence: '' })
+    await this.purgeTable('interlude_overlay_snapshot', { storyId }, { status: 'superseded', summary: '[管理员已删除 overlay 归档]', majorEvents: [], sourcePatchIds: [] })
     await this.purgeTable('interlude_web_observation', { storyId }, { status: 'deleted', url: '', title: '', excerpt: '', summary: '[管理员已删除网页观察]' })
     const now = new Date()
     const story = await this.getStory(storyId)
@@ -770,7 +820,7 @@ export class InterludeService extends Service {
     try {
     const tables = [
       'interlude_script_entry', 'interlude_memory', 'interlude_intent',
-      'interlude_scene', 'interlude_arc', 'interlude_fact', 'interlude_state_patch', 'interlude_web_observation',
+      'interlude_scene', 'interlude_arc', 'interlude_fact', 'interlude_state_patch', 'interlude_overlay_snapshot', 'interlude_web_observation',
       'interlude_participant', 'interlude_story',
     ] as const
     let removed = 0
@@ -909,7 +959,12 @@ export class InterludeService extends Service {
       return false
     }
     let participant = await this.findParticipant(session, story)
-    if (!participant && (this.config.runtime.autoCreate || this.sharedStoryConfig.autoEnrollParticipants)) {
+    if (participant) {
+      // A whitelist row can be edited after this QQ first joined the shared
+      // story. Refresh the current branch before composing its model context.
+      // ensureParticipant performs no write when nothing actually changed.
+      participant = await this.ensureParticipant(story, session, new Date(), participant)
+    } else if (this.config.runtime.autoCreate || this.sharedStoryConfig.autoEnrollParticipants) {
       participant = await this.ensureParticipant(story, session)
     }
     if (!participant || participant.status !== 'active') {
@@ -917,8 +972,9 @@ export class InterludeService extends Service {
       return false
     }
     this.reportOperation('diagnostic', 'debug', story, 'user-message', '收到参与者私聊消息 参与者=%s', participant.id)
+    const visualInput = this.describeVisionEvent(session)
     if (this.config.logging?.logMessageContent) {
-      this.reportOperation('diagnostic', 'info', story, 'user-message', '用户消息内容：%s', session.content.slice(0, this.config.logging.previewLength))
+      this.reportOperation('diagnostic', 'info', story, 'user-message', '用户消息内容：%s', visualInput.content.slice(0, this.config.logging.previewLength))
     }
 
     const accepted = await this.serial(story.id, async () => {
@@ -931,7 +987,7 @@ export class InterludeService extends Service {
         ? await this.cancelPendingOutgoingMessages(current.id, incomingParticipant.id, now)
         : []
       await this.appendEntry(current.id, {
-        kind: 'user-message', actor: 'user', content: session.content,
+        kind: 'user-message', actor: 'user', content: visualInput.content,
         occurredAt: now.toISOString(), metadata: { platform: session.platform, messageId: session.messageId, personId: incomingParticipant.personId },
       }, now, incomingParticipant.id)
       // Messages are persisted at arrival. The model request itself is
@@ -940,7 +996,10 @@ export class InterludeService extends Service {
       return { story: current, participant: incomingParticipant, now, superseded }
     })
     if (!accepted) return false
-    this.bufferUserNarrative(accepted.story, accepted.participant, session, accepted.now, accepted.superseded)
+    this.bufferUserNarrative(accepted.story, accepted.participant, session, accepted.now, accepted.superseded, visualInput.content, visualInput.sources)
+    if (visualInput.sources.length) {
+      this.reportOperation('standard', 'info', accepted.story, 'user-message', '当前事件包含图片附件 数量=%d 原生识图=%s', visualInput.sources.length, this.config.model.vision?.enabled ? '开启' : '关闭')
+    }
     this.reportOperation('standard', 'info', accepted.story, 'user-message', '用户回合已入队 参与者=%s 已取消旧计划=%d', accepted.participant.id, accepted.superseded.length)
     return true
   }
@@ -1106,7 +1165,7 @@ export class InterludeService extends Service {
    * Persisted messages wait here briefly before they reach the narrator. This
    * makes “你好 / 在吗 / 我有件事想问” one event without risking message loss.
    */
-  private bufferUserNarrative(story: InterludeStory, participant: InterludeParticipant, session: Session, now: Date, supersededIntents: NarrativeIntent[]) {
+  private bufferUserNarrative(story: InterludeStory, participant: InterludeParticipant, session: Session, now: Date, supersededIntents: NarrativeIntent[], content = String(session.content ?? ''), imageSources: string[] = []) {
     const key = participant.id
     const existing = this.bufferedNarrativeTurns.get(key)
     const turn: BufferedNarrativeTurn = existing ?? {
@@ -1118,7 +1177,7 @@ export class InterludeService extends Service {
       turn.obsoleteRequestIds.add(turn.inFlightRequestId)
       this.reportOperation('standard', 'info', story, 'user-message', '连续消息使旧请求过期 参与者=%s 请求=%d', participant.id, turn.inFlightRequestId)
     }
-    turn.messages.push({ content: session.content, occurredAt: now, supersededIntents })
+    turn.messages.push({ content, occurredAt: now, supersededIntents, imageSources })
     turn.latestSession = session
     if (turn.timer) turn.timer()
     const revision = ++turn.nextRevision
@@ -1126,6 +1185,120 @@ export class InterludeService extends Service {
     turn.timer = this.ctx.setTimeout(() => void this.flushBufferedNarrative(key, revision), delay)
     this.bufferedNarrativeTurns.set(key, turn)
     this.reportOperation('diagnostic', 'debug', story, 'user-message', '短时消息合并 参与者=%s 待处理=%d 等待=%dms', participant.id, turn.messages.length, delay)
+  }
+
+  /** Extract structured image segments without treating them as a second event. */
+  private describeVisionEvent(session: Session) {
+    const raw = String(session.content ?? '')
+    const sources = extractSessionImageSources(session)
+    const text = raw.replace(/<\/?(?:img|image)\b[^>]*>/gi, '').replace(/\[CQ:image,[^\]]*\]/gi, '').trim()
+    // The attachment itself is passed through the native multimodal channel.
+    // Keep ordinary text free of image placeholders: a failed/filtered fetch
+    // must look like no visual input rather than an invitation to invent one.
+    const content = text
+    return { content, sources }
+  }
+
+  private async loadNativeImages(story: InterludeStory, sources: string[], session?: Session): Promise<NarrativeImage[]> {
+    if (!this.config.model.vision?.enabled || !sources.length) return []
+    const images: NarrativeImage[] = []
+    for (const [index, source] of sources.slice(0, 3).entries()) {
+      try {
+        const image = await this.fetchNativeImage(source, (session as any)?.bot)
+        if (image) images.push({ id: `turn-image-${index + 1}`, ...image })
+      } catch (error) {
+        this.reportStandalone('warn', '图片读取失败，已继续处理文字消息 错误=%s', error)
+      }
+    }
+    return images
+  }
+
+  private async fetchNativeImage(source: string, bot?: any, adapterProvided = false): Promise<{ mimeType: string, dataUri: string } | undefined> {
+    const value = String(source ?? '').trim()
+    if (value.startsWith('onebot-url:')) {
+      const url = value.slice('onebot-url:'.length)
+      return this.fetchNativeImage(url, bot, true)
+    }
+    if (value.startsWith('onebot-file:')) {
+      const file = value.slice('onebot-file:'.length)
+      if (!file || !bot?.getImage) return undefined
+      const info = await bot.getImage(file)
+      const candidates = [info?.url, info?.file, info?.path].map(item => String(item ?? '').trim()).filter(Boolean)
+      for (const candidate of candidates) {
+        if (/^https?:\/\//i.test(candidate)) {
+          const image = await this.fetchNativeImage(candidate, undefined, true)
+          if (image) return image
+        } else {
+          try {
+            const bytes = await readFile(candidate)
+            const image = await this.imageBytesToNative(bytes, guessImageMime(bytes, info?.type))
+            if (image) return image
+          } catch { /* adapter may return a non-local alias; try its next field */ }
+        }
+      }
+      return undefined
+    }
+    if (/^data:image\//i.test(value)) {
+      const match = /^data:(image\/[a-z0-9.+-]+);base64,([a-z0-9+/=\s]+)$/i.exec(value)
+      if (!match) return undefined
+      const bytes = Buffer.from(match[2].replace(/\s+/g, ''), 'base64')
+      if (!bytes.length || bytes.length > 4 * 1024 * 1024) return undefined
+      const mimeType = match[1].toLowerCase()
+      return this.imageBytesToNative(bytes, mimeType)
+    }
+    let url: URL
+    try { url = new URL(value) } catch { return undefined }
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') return undefined
+    if (!adapterProvided && !isTrustedImageHost(url.hostname)) return undefined
+    const response = await this.ctx.http('GET', url.href, { responseType: 'arraybuffer', timeout: 10_000, redirect: 'error' })
+    const bytes = Buffer.from(response.data)
+    if (!bytes.length || bytes.length > 4 * 1024 * 1024) return undefined
+    const mimeType = response.headers.get('content-type')?.split(';')[0].trim().toLowerCase() || guessImageMime(bytes)
+    return this.imageBytesToNative(bytes, mimeType)
+  }
+
+  /** Convert adapter/fetched bytes into one bounded native-vision attachment.
+   * Animated stickers are rendered to a representative PNG frame when the
+   * optional Puppeteer service is available; otherwise the original image is
+   * still passed through rather than inventing a description. */
+  private async imageBytesToNative(bytes: Buffer, mimeType: string): Promise<{ mimeType: string, dataUri: string } | undefined> {
+    const normalized = String(mimeType || guessImageMime(bytes) || '').toLowerCase()
+    if (!normalized.startsWith('image/')) return undefined
+    const dataUri = `data:${normalized};base64,${bytes.toString('base64')}`
+    if (isAnimatedImageMime(normalized)) {
+      const frame = await this.renderAnimatedImageFrame(dataUri)
+      if (frame) return frame
+      this.reportStandalone('warn', '动态图片未能抽帧，已使用原始图片输入；请启用 Puppeteer 以提高识别兼容性。')
+    }
+    return { mimeType: normalized, dataUri }
+  }
+
+  private async renderAnimatedImageFrame(dataUri: string) {
+    const puppeteer = (this.ctx as any).puppeteer
+    if (!puppeteer?.page) return undefined
+    return this.withBrowserSlot(async () => {
+      let page: any
+      try {
+        page = await puppeteer.page()
+        await page.setContent(`<img id="hdsi-image" src="${dataUri}" style="display:block;max-width:4096px;max-height:4096px">`, { waitUntil: 'load', timeout: 10_000 })
+        await page.evaluate(() => new Promise<void>(resolve => {
+          const image = document.querySelector('#hdsi-image') as HTMLImageElement | null
+          if (!image || image.complete) return resolve()
+          image.addEventListener('load', () => resolve(), { once: true })
+          image.addEventListener('error', () => resolve(), { once: true })
+        }))
+        const element = await page.$('#hdsi-image')
+        if (!element) return undefined
+        const buffer = Buffer.from(await element.screenshot({ type: 'png' }))
+        if (!buffer.length || buffer.length > 4 * 1024 * 1024) return undefined
+        return { mimeType: 'image/png', dataUri: `data:image/png;base64,${buffer.toString('base64')}` }
+      } catch (error) {
+        this.reportStandalone('debug', '动态图片抽帧失败：%s', error)
+        return undefined
+      } finally {
+        if (page) await page.close().catch(() => undefined)
+      }
+    })
   }
 
   /** Prevent timers or already-returning model calls from resurrecting data
@@ -1184,6 +1357,9 @@ export class InterludeService extends Service {
     }
     const requestId = revision
     turn.inFlightRequestId = requestId
+    // Start the stale-request window before any image download. Image fetches
+    // are part of this request; otherwise a slow CDN response leaves a gap in
+    // which new messages cannot supersede the old turn.
     turn.inFlightStartedAt = Date.now()
     try {
       // Snapshot only the lightweight decision inputs under the story lock.
@@ -1201,9 +1377,17 @@ export class InterludeService extends Service {
       if (!snapshot) return
 
       const userMessage = formatBufferedUserMessages(batch)
+      const imageSources = Array.from(new Set(batch.flatMap(message => message.imageSources))).slice(0, 3)
+      const images = await this.loadNativeImages(snapshot.story, imageSources, turn.latestSession)
+      // If another message arrived while an image was being downloaded, put
+      // this batch back and let the newer revision compose one combined event.
+      if (turn.nextRevision !== revision) {
+        turn.messages.unshift(...batch)
+        return
+      }
       const superseded = batch.flatMap(message => message.supersededIntents)
       const { decision, succeeded, effectiveNow, immediateObservations } = await this.tryDecide(
-        snapshot.story, snapshot.participant, 'user-message', snapshot.from, snapshot.now, userMessage, snapshot.due, superseded,
+        snapshot.story, snapshot.participant, 'user-message', snapshot.from, snapshot.now, userMessage, snapshot.due, superseded, undefined, images,
       )
 
       const result = await this.serial(turn.storyId, async () => {
@@ -1271,6 +1455,31 @@ export class InterludeService extends Service {
     return this.serial(story.id, async () => this.compactUnlocked(await this.getStory(story.id), new Date(), force))
   }
 
+  /** Merge and compress already-applied overlay patches without running the
+   * full scene/fact compaction pass. This is safe for manual maintenance. */
+  async compactOverlay(story: InterludeStory) {
+    if (!this.canHandleStory(story)) return false
+    return this.serial(story.id, async () => this.compactOverlayUnlocked(await this.getStory(story.id), new Date()))
+  }
+
+  /** Administrative overlay view used by the Console command. */
+  async adminOverlayStatus(storyId: string) {
+    const [story, patches, snapshots, participants] = await Promise.all([
+      this.getStory(storyId),
+      this.dbGet('interlude_state_patch', { storyId }, { sort: { createdAt: 'desc' } }) as Promise<StatePatchProposal[]>,
+      this.dbGet('interlude_overlay_snapshot', { storyId, status: 'active' }, { sort: { periodEnd: 'desc' } }) as Promise<OverlaySnapshot[]>,
+      this.participants(storyId, true),
+    ])
+    return {
+      state: story.state.settingOverlay ?? {},
+      proposed: patches.filter(patch => patch.status === 'proposed'),
+      applied: patches.filter(patch => patch.status === 'applied' || patch.status === 'compacted'),
+      cleared: patches.filter(patch => patch.status === 'cleared'),
+      snapshots,
+      participantOverlays: participants.filter(participant => !!normalizeParticipantState(participant.state).relationshipOverlay),
+    }
+  }
+
   async sweep() {
     if (this.databaseResetting || this.sweepRunning) return
     this.sweepRunning = true
@@ -1311,7 +1520,13 @@ export class InterludeService extends Service {
     // Later <sep/> bubbles are delivery events, not new writing turns.  They
     // are persisted only at their actual send time, which also lets a newer
     // incoming message cancel them before the character "finishes typing".
-    const splitSegments = due.filter(intent => intent.type === 'split-message')
+    // Deliver at most one split segment per wake-up. If the scheduler was
+    // blocked for a while, sending every overdue segment together would skip
+    // the configured typing-time simulation.
+    const splitSegments = due
+      .filter(intent => intent.type === 'split-message')
+      .sort((left, right) => left.notBefore.getTime() - right.notBefore.getTime())
+      .slice(0, 1)
     for (const intent of splitSegments) {
       const content = clip(intent.payload?.content, this.config.runtime.maxMessageCharacters)
       const participant = intent.participantId ? await this.getParticipant(intent.participantId) : undefined
@@ -1448,7 +1663,7 @@ export class InterludeService extends Service {
     return messages
   }
 
-  private async decide(story: InterludeStory, participant: InterludeParticipant | null, phase: NarrativeRequest['phase'], from: Date, now: Date, userMessage: string | undefined, dueIntents: NarrativeIntent[], supersededIntents: NarrativeIntent[] = [], groupContext?: GroupContext, extraWebContext: WebObservation[] = []) {
+  private async decide(story: InterludeStory, participant: InterludeParticipant | null, phase: NarrativeRequest['phase'], from: Date, now: Date, userMessage: string | undefined, dueIntents: NarrativeIntent[], supersededIntents: NarrativeIntent[] = [], groupContext?: GroupContext, images: NarrativeImage[] = [], extraWebContext: WebObservation[] = []) {
     // 这里是主模型上下文的唯一入口。recentEntries 保留近距离质感，场景、弧线和
     // facts 负责把很长的过去压缩成连续性线索。参与者摘要让模型知道角色
     // 同时还在与谁维系关系，而不是把每个 QQ 当成独立世界。
@@ -1457,7 +1672,7 @@ export class InterludeService extends Service {
     // database operation rather than a separate model request.
     await this.expireActiveConsequences(story.id, now)
     const factQuery = createFactQuery(participant, userMessage, dueIntents, supersededIntents)
-    const [recentEntries, memories, scene, arc, facts, allParticipants, webContext, activeConsequences] = await Promise.all([
+    const [recentEntries, memories, scene, arc, facts, allParticipants, webContext, activeConsequences, overlaySnapshots] = await Promise.all([
       // Use the runtime limits on the live path.  They are the options shown
       // to testers as “上下文条目/长期事实”，and should be authoritative.
       this.recentEntries(story.id, this.config.runtime.contextEntryLimit),
@@ -1472,6 +1687,7 @@ export class InterludeService extends Service {
         now,
         phase === 'advance' || this.sharedStoryConfig.shareParticipantDetails ? undefined : participant?.id,
       ),
+      this.overlaySnapshotsForPrompt(story.id, participant?.id, phase === 'advance'),
     ])
     const visibleEntries = this.sharedStoryConfig.shareParticipantDetails
       ? recentEntries
@@ -1509,8 +1725,9 @@ export class InterludeService extends Service {
       .filter(observation => observation.status !== 'deleted')
       .sort((left, right) => left.accessedAt.getTime() - right.accessedAt.getTime())
       .slice(-Math.max(1, this.browserConfig.maxObservationsInPrompt))
+    const refreshContinuity = this.shouldRefreshContinuity(story, phase)
     return this.narrator.decide({
-      phase, story, from, now, userMessage,
+      phase, refreshContinuity, story, from, now, userMessage, images,
       participant: phase === 'advance' ? null : participant,
       // A background turn may see relationship state through these opaque
       // participant summaries and may proactively contact one account only
@@ -1518,11 +1735,20 @@ export class InterludeService extends Service {
       participants: phase === 'advance' && !advanceCanContact ? [] : participants,
       dueIntents: visibleDueIntents, activeConsequences: visibleConsequences, supersededIntents,
       shareParticipantDetails: this.sharedStoryConfig.shareParticipantDetails,
-      recentEntries: promptEntries, memories, sceneContext: { scene, arc }, facts, groupContext, webContext: mergedWebContext,
+      recentEntries: promptEntries, memories, sceneContext: { scene, arc }, facts, groupContext, webContext: mergedWebContext, overlaySnapshots,
     })
   }
 
-  private async tryDecide(story: InterludeStory, participant: InterludeParticipant | null, phase: NarrativeRequest['phase'], from: Date, now: Date, userMessage: string | undefined, dueIntents: NarrativeIntent[], supersededIntents: NarrativeIntent[] = [], groupContext?: GroupContext) {
+  /** Refresh continuity only on the first automatic pass or every fifteenth
+   * successful narrative write. Ordinary turns reuse the last snapshot. */
+  private shouldRefreshContinuity(story: InterludeStory, phase: NarrativeRequest['phase']) {
+    const state = normalizeStoryState(story.state)
+    if (phase === 'advance' && !state.continuitySnapshot) return true
+    const count = Math.max(0, Math.floor(state.narrativeUpdateCount || 0))
+    return (count + 1) % 15 === 0
+  }
+
+  private async tryDecide(story: InterludeStory, participant: InterludeParticipant | null, phase: NarrativeRequest['phase'], from: Date, now: Date, userMessage: string | undefined, dueIntents: NarrativeIntent[], supersededIntents: NarrativeIntent[] = [], groupContext?: GroupContext, images: NarrativeImage[] = []) {
     let immediateObservations: WebObservation[] = []
     let effectiveNow = now
     const startedAt = Date.now()
@@ -1530,7 +1756,7 @@ export class InterludeService extends Service {
       '模型调用开始 任务=主叙事 模型=%s 参与者=%s 时间段=%s→%s 到期计划=%d',
       this.mainModelLabel(), participant?.id || '全局', formatLogTime(from, story.setting.timezone), formatLogTime(now, story.setting.timezone), dueIntents.length)
     try {
-      let decision = await this.decide(story, participant, phase, from, effectiveNow, userMessage, dueIntents, supersededIntents, groupContext)
+      let decision = await this.decide(story, participant, phase, from, effectiveNow, userMessage, dueIntents, supersededIntents, groupContext, images)
       const immediate = phase === 'user-message' && participant && !groupContext && this.browserConfig.enabled && this.browserConfig.mode === 'allow-immediate'
         ? decision.browserIntents?.map(intent => normalizeBrowserIntentDraft(intent, this.browserConfig)).find(intent => intent?.timing === 'immediate')
         : undefined
@@ -1543,7 +1769,7 @@ export class InterludeService extends Service {
         const observation = await this.collectWebObservation(story, immediate, participant.id, null, new Date(), false)
         immediateObservations = [observation]
         effectiveNow = new Date()
-        decision = await this.decide(story, participant, phase, from, effectiveNow, userMessage, dueIntents, supersededIntents, groupContext, immediateObservations)
+        decision = await this.decide(story, participant, phase, from, effectiveNow, userMessage, dueIntents, supersededIntents, groupContext, images, immediateObservations)
       }
       const result = {
         decision,
@@ -1568,9 +1794,10 @@ export class InterludeService extends Service {
     // 先规范化，再写库：不信任模型给出的时间、长度和结构，尤其不能让未来剧情落库。
     const allParticipants = await this.participants(story.id)
     const permittedParticipantIds = new Set(allParticipants.filter(item => this.canHandleParticipant(item)).map(item => item.id))
+    const refreshContinuity = this.shouldRefreshContinuity(story, phase)
     const decision = normalizeDecision(
       raw, from, now, permitMessages, this.config.runtime, this.sharedStoryConfig,
-      participant?.id ?? '', permittedParticipantIds, phase, this.memoryConfig,
+      participant?.id ?? '', permittedParticipantIds, phase, this.memoryConfig, refreshContinuity,
     )
     if (decision.script) {
       await this.appendEntry(story.id, {
@@ -1608,6 +1835,17 @@ export class InterludeService extends Service {
     }
     if (participant && decision.statePatch) await this.updateParticipantState(participant, decision.statePatch, now)
 
+    if (decision.script) {
+      const state = normalizeStoryState(story.state)
+      const nextCount = Math.max(0, Math.floor(state.narrativeUpdateCount || 0)) + 1
+      const nextState: StoryState = { ...state, narrativeUpdateCount: nextCount }
+      if (decision.continuity) {
+        nextState.continuitySnapshot = decision.continuity
+        nextState.lastContinuityUpdateAt = now.toISOString()
+      }
+      await this.dbSet('interlude_story', { id: story.id }, { state: nextState, updatedAt: now })
+    }
+
     const messages: OutgoingMessageDraft[] = []
     const interaction = decision.interaction
     if (participant && interaction?.seen) await this.markParticipantSeen(participant, now)
@@ -1635,14 +1873,21 @@ export class InterludeService extends Service {
     const crossActions = phase === 'user-message' || this.config.runtime.allowProactiveMessages
       ? decision.crossConversationActions
       : []
+    if (phase === 'advance' && decision.crossConversationActions.length) {
+      this.reportOperation('standard', 'info', story, phase, '主动联系候选通过 数量=%d 意愿=%s',
+        decision.crossConversationActions.length,
+        decision.crossConversationActions.map(action => typeof action.willingness === 'number' ? action.willingness.toFixed(2) : '?').join(','))
+    }
     for (const action of crossActions) {
       if (action.mode === 'immediate') {
         messages.push({ participantId: action.participantId, content: action.content })
       } else {
-        const sendAt = new Date(action.sendAt!)
+        const sendAtValue = (action as { sendAt?: string }).sendAt
+        if (action.mode !== 'delayed' || !sendAtValue) continue
+        const sendAt = new Date(sendAtValue)
         await this.appendIntent(story.id, {
           type: 'cross-conversation-message', summary: 'The character planned a message to another relationship branch.',
-          notBefore: action.sendAt!, payload: { content: action.content, userInitiated: false, crossConversation: true },
+          notBefore: sendAtValue, payload: { content: action.content, userInitiated: false, crossConversation: true, willingness: action.willingness, reason: action.reason },
         }, now, action.participantId)
         this.scheduleDueIntentWake(story.id, sendAt)
       }
@@ -1720,7 +1965,7 @@ export class InterludeService extends Service {
     // Keep enough candidates for semantic re-ranking without making the
     // latency-sensitive path do unnecessary database work.
     const candidateLimit = Math.max(20, Math.min(limit * 5, this.memoryConfig.maxFactsPerStory, 300))
-    const rows = await this.ctx.database.get('interlude_fact', { storyId, status: 'active' }, {
+    const rows = await this.dbGet('interlude_fact', { storyId, status: 'active' }, {
       limit: candidateLimit,
       sort: { importance: 'desc', updatedAt: 'desc' },
     })
@@ -1747,7 +1992,7 @@ export class InterludeService extends Service {
     // feature is disabled, which is the default for most installations.
     if (!this.browserConfig.enabled) return []
     const limit = Math.max(1, Math.min(this.browserConfig.maxObservationsInPrompt, 20))
-    const rows = await this.ctx.database.get('interlude_web_observation', { storyId }, {
+    const rows = await this.dbGet('interlude_web_observation', { storyId }, {
       limit: Math.max(limit * 4, 20), sort: { accessedAt: 'desc' },
     })
     return rows
@@ -1762,7 +2007,7 @@ export class InterludeService extends Service {
   }
 
   async activeScene(storyId: string): Promise<InterludeScene | null> {
-    const rows = await this.ctx.database.get('interlude_scene', { storyId, status: 'active' }, {
+    const rows = await this.dbGet('interlude_scene', { storyId, status: 'active' }, {
       limit: 1,
       sort: { updatedAt: 'desc' },
     })
@@ -1770,7 +2015,7 @@ export class InterludeService extends Service {
   }
 
   async activeArc(storyId: string): Promise<InterludeArc | null> {
-    const rows = await this.ctx.database.get('interlude_arc', { storyId, status: 'active' }, {
+    const rows = await this.dbGet('interlude_arc', { storyId, status: 'active' }, {
       limit: 1,
       sort: { updatedAt: 'desc' },
     })
@@ -1807,7 +2052,7 @@ export class InterludeService extends Service {
    * their existing behaviour without a migration. */
   private async activeConsequences(storyId: string, now: Date, participantId?: string) {
     if (!this.memoryConfig.activeConsequencesEnabled) return []
-    const rows = await this.ctx.database.get('interlude_intent', { storyId, status: 'pending' }, {
+    const rows = await this.dbGet('interlude_intent', { storyId, status: 'pending' }, {
       limit: 100, sort: { updatedAt: 'desc' },
     })
     return rows
@@ -1825,7 +2070,7 @@ export class InterludeService extends Service {
 
   private async expireActiveConsequences(storyId: string, now: Date) {
     if (!this.memoryConfig.activeConsequencesEnabled) return
-    const rows = await this.ctx.database.get('interlude_intent', { storyId, status: 'pending' }, {
+    const rows = await this.dbGet('interlude_intent', { storyId, status: 'pending' }, {
       limit: 100, sort: { updatedAt: 'asc' },
     })
     const expired = rows.filter(intent => isActiveConsequence(intent) && (consequenceExpiresAt(intent.payload)?.getTime() ?? 0) <= now.getTime())
@@ -1839,7 +2084,7 @@ export class InterludeService extends Service {
   private async applyIntentUpdates(storyId: string, updates: ReturnType<typeof normalizeIntentUpdates>, now: Date, participantId?: string) {
     if (!updates.length) return
     const ids = updates.map(update => update.id)
-    const rows = await this.ctx.database.get('interlude_intent', { storyId, id: { $in: ids }, status: 'pending' })
+    const rows = await this.dbGet('interlude_intent', { storyId, id: { $in: ids }, status: 'pending' })
     const allowed = new Map(rows
       .filter(isActiveConsequence)
       .filter(intent => !participantId || !intent.participantId || intent.participantId === participantId)
@@ -2100,22 +2345,40 @@ export class InterludeService extends Service {
     const result = await this.serial(storyId, async () => {
       const story = await this.getStory(storyId)
       const now = new Date()
-      const due = (await this.dueIntents(storyId, now)).filter(intent => intent.type === 'split-message')
+      const due = (await this.dueIntents(storyId, now))
+        .filter(intent => intent.type === 'split-message')
+        .sort((left, right) => left.notBefore.getTime() - right.notBefore.getTime())
+      const next = due[0]
       const messages: OutgoingMessageDraft[] = []
-      for (const intent of due) {
+      if (next) {
+        const intent = next
         const content = clip(intent.payload?.content, this.config.runtime.maxMessageCharacters)
         const participant = intent.participantId ? await this.getParticipant(intent.participantId) : undefined
         if (!content || !participant || participant.status !== 'active') {
           await this.dbSet('interlude_intent', { id: intent.id }, { status: 'cancelled', updatedAt: now })
-          continue
+        } else {
+          await this.appendEntry(storyId, {
+            kind: 'character-message', actor: 'character', content,
+            occurredAt: now.toISOString(), metadata: { visible: true, splitSegment: true },
+          }, now, participant.id)
+          await this.recordCharacterMessage(participant, now)
+          await this.dbSet('interlude_intent', { id: intent.id }, { status: 'completed', updatedAt: now })
+          messages.push({ participantId: participant.id, content })
         }
-        await this.appendEntry(storyId, {
-          kind: 'character-message', actor: 'character', content,
-          occurredAt: now.toISOString(), metadata: { visible: true, splitSegment: true },
-        }, now, participant.id)
-        await this.recordCharacterMessage(participant, now)
-        await this.dbSet('interlude_intent', { id: intent.id }, { status: 'completed', updatedAt: now })
-        messages.push({ participantId: participant.id, content })
+      }
+      // When several segments became overdue together, restore a fresh
+      // typing interval instead of immediately draining the backlog.
+      const remaining = due.slice(1)
+      if (remaining.length) {
+        const following = remaining[0]
+        if (following.notBefore <= now) {
+          const followingContent = clip(following.payload?.content, this.config.runtime.maxMessageCharacters)
+          if (followingContent) {
+            await this.dbSet('interlude_intent', { id: following.id }, {
+              notBefore: new Date(now.getTime() + this.typingDelayMilliseconds(followingContent)), updatedAt: now,
+            })
+          }
+        }
       }
       await this.scheduleNextSplitWake(storyId)
       return { story, messages }
@@ -2413,7 +2676,7 @@ export class InterludeService extends Service {
 
   /** Rebuild per-account relationship baselines and discard evolving state. */
   private async resetParticipantCanon(storyId: string, now: Date) {
-    const participants = await this.ctx.database.get('interlude_participant', { storyId })
+    const participants = await this.dbGet('interlude_participant', { storyId })
     for (const participant of participants) {
       const account = this.userAccountRule(participant.userId)
       const preset = this.participantPreset(participant.userId)
@@ -2435,7 +2698,7 @@ export class InterludeService extends Service {
   }
 
   private async getParticipant(id: string) {
-    return (await this.ctx.database.get('interlude_participant', { id }))[0]
+    return (await this.dbGet('interlude_participant', { id }))[0]
   }
 
   private async recordIncomingMessage(participant: InterludeParticipant, now: Date) {
@@ -2508,12 +2771,12 @@ export class InterludeService extends Service {
     const participant = await this.ensureParticipant(story, session, now)
     const tables = [
       'interlude_script_entry', 'interlude_memory', 'interlude_intent',
-      'interlude_scene', 'interlude_arc', 'interlude_fact', 'interlude_state_patch', 'interlude_web_observation',
+      'interlude_scene', 'interlude_arc', 'interlude_fact', 'interlude_state_patch', 'interlude_overlay_snapshot', 'interlude_web_observation',
     ] as const
     for (const table of tables) await this.dbSet(table, { storyId: legacy.id }, { storyId: story.id } as any)
     // The old story only had one user, so account-bound records can safely be
     // attached to that initial relationship branch during migration.
-    for (const table of ['interlude_script_entry', 'interlude_memory', 'interlude_intent', 'interlude_fact', 'interlude_state_patch', 'interlude_web_observation'] as const) {
+    for (const table of ['interlude_script_entry', 'interlude_memory', 'interlude_intent', 'interlude_fact', 'interlude_state_patch', 'interlude_overlay_snapshot', 'interlude_web_observation'] as const) {
       await this.dbSet(table, { storyId: story.id }, { participantId: participant.id } as any)
     }
     await this.dbSet('interlude_story', { id: legacy.id }, { status: 'archived', updatedAt: now })
@@ -2534,7 +2797,7 @@ export class InterludeService extends Service {
     if (!legacy || legacy.status === 'archived') return
     const now = new Date()
     const participant = await this.ensureParticipant(story, session, now)
-    for (const table of ['interlude_script_entry', 'interlude_memory', 'interlude_intent', 'interlude_fact', 'interlude_state_patch', 'interlude_web_observation'] as const) {
+    for (const table of ['interlude_script_entry', 'interlude_memory', 'interlude_intent', 'interlude_fact', 'interlude_state_patch', 'interlude_overlay_snapshot', 'interlude_web_observation'] as const) {
       await this.dbSet(table, { storyId: legacy.id }, { storyId: story.id, participantId: participant.id } as any)
     }
     await this.dbSet('interlude_story', { id: legacy.id }, { status: 'archived', updatedAt: now })
@@ -2569,7 +2832,10 @@ export class InterludeService extends Service {
       unresolvedWeight: 0.2,
       statePatchConfidenceThreshold: 0.82,
       majorStatePatchConfidenceThreshold: 0.95,
-      statePatchMinEvidence: 2,
+      statePatchMinEvidence: 3,
+      statePatchMinTurns: 3,
+      statePatchMinDays: 2,
+      statePatchCooldownHours: 72,
       autoApplyStatePatches: true,
       allowMajorStateChanges: true,
       maxFactsPerStory: 200,
@@ -2577,6 +2843,13 @@ export class InterludeService extends Service {
       activeConsequencePromptLimit: 6,
       activeConsequenceMaxDays: 7,
       activeConsequenceDefaultStrength: 0.55,
+      overlayCompressionEnabled: true,
+      overlayRecentDays: 2,
+      overlayMonthlyAfterDays: 10,
+      overlayWeeklyWindowDays: 5,
+      overlayMonthlyWindowDays: 10,
+      overlayWeeklySummaryCharacters: 1_600,
+      overlayMonthlySummaryCharacters: 2_400,
       ...(this.config.memory ?? {}),
     }
   }
@@ -2684,8 +2957,9 @@ export class InterludeService extends Service {
 
   private async compactUnlocked(story: InterludeStory, now: Date, force: boolean) {
     await this.ensureContinuity(story, now)
+    const overlayCompacted = await this.compactOverlayUnlocked(story, now)
     const scene = await this.activeScene(story.id)
-    if (!scene) return false
+    if (!scene) return overlayCompacted
     // lastEntryId 将场景摘要变成增量检查点：已经压缩过的原文不再重复传给模型。
     const entryFilter: any = { storyId: story.id, occurredAt: { $gte: scene.startedAt } }
     if (scene.lastEntryId != null) entryFilter.id = { $gt: scene.lastEntryId }
@@ -2698,7 +2972,7 @@ export class InterludeService extends Service {
     // 任一阈值达到即可压缩；手动命令可以 force，用于调试或故事阶段转换。
     if (!force && sceneEntries.length < this.memoryConfig.sceneEntryThreshold && chars < this.memoryConfig.sceneCharacterThreshold) {
       this.reportOperation('diagnostic', 'debug', story, 'advance', '记忆整理跳过：未达到阈值 条目=%d/%d 字符=%d/%d', sceneEntries.length, this.memoryConfig.sceneEntryThreshold, chars, this.memoryConfig.sceneCharacterThreshold)
-      return false
+      return overlayCompacted
     }
     const current = await this.getStory(story.id)
     const participants = await this.participants(story.id)
@@ -2727,6 +3001,122 @@ export class InterludeService extends Service {
     await this.persistCompaction(current, scene, decision, sceneEntries, now)
     this.reportOperation('standard', 'info', story, 'advance', '记忆整理完成 耗时=%dms 剧本条目=%d 长期事实=%d 状态变更=%d', Date.now() - startedAt, sceneEntries.length, decision.facts?.length ?? 0, decision.statePatches?.length ?? 0)
     return true
+  }
+
+  /** Older state patches are compacted only by the background maintenance
+   * lane. Live turns always retain the last few days as raw detail. */
+  private async compactOverlayUnlocked(story: InterludeStory, now: Date) {
+    const config = this.memoryConfig
+    if (!config.overlayCompressionEnabled) return false
+    try {
+    const recentCutoff = new Date(now.getTime() - (config.overlayRecentDays ?? 2) * Time.day)
+    const monthlyCutoff = new Date(now.getTime() - (config.overlayMonthlyAfterDays ?? 10) * Time.day)
+    const applied = await this.dbGet('interlude_state_patch', { storyId: story.id, status: 'applied' }, { sort: { appliedAt: 'asc' } }) as StatePatchProposal[]
+    const weekly = applied.filter(patch => (patch.appliedAt ?? patch.createdAt) <= recentCutoff)
+    let changed = false
+    for (const group of groupOverlayPatches(weekly, config.overlayWeeklyWindowDays ?? 5)) {
+      const existing = (await this.dbGet('interlude_overlay_snapshot', {
+        storyId: story.id, participantId: group.participantId, target: group.target, tier: 'weekly', periodStart: group.from,
+      }))[0] as OverlaySnapshot | undefined
+      if (existing) continue
+      const participant = group.participantId ? await this.getParticipant(group.participantId) : undefined
+      const decision = await this.compactor.compactOverlay({ story, participant, target: group.target, tier: 'weekly', from: group.from, to: group.to, patches: group.patches })
+      const summary = clip(decision.summary, config.overlayWeeklySummaryCharacters ?? 1_600)
+      if (!summary) continue
+      await this.dbCreate('interlude_overlay_snapshot', {
+        storyId: story.id, participantId: group.participantId, target: group.target, tier: 'weekly', periodStart: group.from, periodEnd: group.to,
+        summary, majorEvents: normalizeMajorEvents(decision.majorEvents, group.patches), sourcePatchIds: group.patches.map(patch => patch.id), status: 'active', createdAt: now, updatedAt: now,
+      })
+      for (const patch of group.patches) await this.dbSet('interlude_state_patch', { id: patch.id }, { status: 'compacted' })
+      changed = true
+    }
+
+    const snapshots = await this.dbGet('interlude_overlay_snapshot', { storyId: story.id, tier: 'weekly', status: 'active' }, { sort: { periodEnd: 'asc' } }) as OverlaySnapshot[]
+    for (const group of groupOverlaySnapshots(snapshots.filter(snapshot => snapshot.periodEnd <= monthlyCutoff), config.overlayMonthlyWindowDays ?? 10)) {
+      const existing = (await this.dbGet('interlude_overlay_snapshot', {
+        storyId: story.id, participantId: group.participantId, target: group.target, tier: 'monthly', periodStart: group.from,
+      }))[0] as OverlaySnapshot | undefined
+      if (existing) continue
+      const participant = group.participantId ? await this.getParticipant(group.participantId) : undefined
+      const decision = await this.compactor.compactOverlay({ story, participant, target: group.target, tier: 'monthly', from: group.from, to: group.to, patches: [], snapshots: group.snapshots })
+      const summary = clip(decision.summary, config.overlayMonthlySummaryCharacters ?? 2_400)
+      if (!summary) continue
+      await this.dbCreate('interlude_overlay_snapshot', {
+        storyId: story.id, participantId: group.participantId, target: group.target, tier: 'monthly', periodStart: group.from, periodEnd: group.to,
+        summary, majorEvents: normalizeMajorEvents(decision.majorEvents, [], group.snapshots), sourcePatchIds: group.snapshots.flatMap(snapshot => snapshot.sourcePatchIds), status: 'active', createdAt: now, updatedAt: now,
+      })
+      for (const snapshot of group.snapshots) await this.dbSet('interlude_overlay_snapshot', { id: snapshot.id }, { status: 'superseded', updatedAt: now })
+      changed = true
+    }
+    if (changed) {
+      await this.rebuildLiveOverlayState(story, now)
+      this.reportOperation('standard', 'info', story, 'advance', 'Overlay 分层归档完成：最近 %d 天保留原始补丁，短期窗口=%d天，长期窗口=%d天', config.overlayRecentDays ?? 2, config.overlayWeeklyWindowDays ?? 5, config.overlayMonthlyWindowDays ?? 10)
+    }
+    return changed
+    } catch (error) {
+      // Overlay maintenance is optional background work. A bad compression
+      // response must leave raw patches untouched and never block narration.
+      this.reportOperation('standard', 'warn', story, 'advance', 'Overlay 分层归档跳过：%s', error)
+      return false
+    }
+  }
+
+  private async overlaySnapshotsForPrompt(storyId: string, participantId?: string, background = false) {
+    if (!this.memoryConfig.overlayCompressionEnabled) return [] as OverlaySnapshot[]
+    const rows = await this.dbGet('interlude_overlay_snapshot', { storyId, status: 'active' }, { sort: { periodEnd: 'desc' } }) as OverlaySnapshot[]
+    const visible = rows.filter(snapshot => !snapshot.participantId || (background ? this.sharedStoryConfig.shareParticipantDetails : snapshot.participantId === participantId))
+    // Current long-term state plus recent short-window deltas is sufficient; older
+    // snapshots remain searchable/auditable without permanently taxing prompts.
+    const result: OverlaySnapshot[] = []
+    for (const target of ['character', 'world', 'relationship'] as const) {
+      const matches = visible.filter(snapshot => snapshot.target === target)
+      const monthly = matches.find(snapshot => snapshot.tier === 'monthly')
+      if (monthly) result.push(monthly)
+      result.push(...matches.filter(snapshot => snapshot.tier === 'weekly').slice(0, 4))
+    }
+    return result
+  }
+
+  /** Once a snapshot safely represents older changes, keep state.overlay as
+   * the live (uncompacted) delta only. This is what actually reduces prompt
+   * size; snapshots carry the older evolution separately. */
+  private async rebuildLiveOverlayState(story: InterludeStory, now: Date) {
+    const [applied, snapshots] = await Promise.all([
+      this.dbGet('interlude_state_patch', { storyId: story.id, status: 'applied' }) as Promise<StatePatchProposal[]>,
+      this.dbGet('interlude_overlay_snapshot', { storyId: story.id, status: 'active' }) as Promise<OverlaySnapshot[]>,
+    ])
+    const overlay = { ...(story.state.settingOverlay ?? {}) }
+    const hasGlobalHistory = (target: StatePatchProposal['target']) => snapshots.some(snapshot => snapshot.target === target && !snapshot.participantId)
+    if (hasGlobalHistory('character')) {
+      overlay.characterProfile = undefined
+      overlay.characterTraits = []
+      for (const patch of applied.filter(item => !item.participantId && item.target === 'character')) {
+        if (patch.path.includes('trait')) overlay.characterTraits.push(clip(patch.proposedValue, 500))
+        else overlay.characterProfile = mergeNote(overlay.characterProfile, patch.proposedValue)
+      }
+      overlay.characterTraits = Array.from(new Set(overlay.characterTraits)).slice(-30)
+    }
+    if (hasGlobalHistory('world')) {
+      overlay.world = undefined
+      for (const patch of applied.filter(item => !item.participantId && item.target === 'world')) overlay.world = mergeNote(overlay.world, patch.proposedValue)
+    }
+    if (hasGlobalHistory('relationship')) {
+      overlay.relationship = undefined
+      for (const patch of applied.filter(item => !item.participantId && item.target === 'relationship')) overlay.relationship = mergeNote(overlay.relationship, patch.proposedValue)
+    }
+    await this.dbSet('interlude_story', { id: story.id }, { state: { ...story.state, settingOverlay: overlay }, updatedAt: now })
+
+    const participantIds = Array.from(new Set(snapshots.filter(snapshot => snapshot.target === 'relationship' && !!snapshot.participantId).map(snapshot => snapshot.participantId)))
+    for (const participantId of participantIds) {
+      const participant = await this.getParticipant(participantId)
+      if (!participant) continue
+      const state = normalizeParticipantState(participant.state)
+      state.relationshipOverlay = undefined
+      for (const patch of applied.filter(item => item.target === 'relationship' && item.participantId === participantId)) {
+        state.relationshipOverlay = mergeNote(state.relationshipOverlay, patch.proposedValue)
+      }
+      await this.dbSet('interlude_participant', { id: participant.id }, { state, updatedAt: now })
+    }
   }
 
   private async persistCompaction(story: InterludeStory, scene: InterludeScene, decision: CompactionDecision, entries: ScriptEntry[], now: Date) {
@@ -2829,17 +3219,64 @@ export class InterludeService extends Service {
   private async persistStatePatch(story: InterludeStory, draft: StatePatchDraft, entries: ScriptEntry[], now: Date) {
     const confidence = clampNumber(draft.confidence, 0, 0, 1)
     const participantId = resolveParticipantId(draft.participantId, draft.sourceEntryIds, entries)
+    const path = clip(draft.path, 255)
     const sourceEntryIds = (draft.sourceEntryIds ?? []).filter(id => entries.some(entry => entry.id === id)).slice(0, 20)
-    const proposal = await this.dbCreate('interlude_state_patch', {
-      storyId: story.id, participantId, target: draft.target, path: clip(draft.path, 255), proposedValue: clip(draft.proposedValue, 4_000),
-      evidence: clip(draft.evidence, 4_000), confidence, impact: draft.impact === 'major' ? 'major' : 'minor',
-      status: 'proposed', sourceEntryIds, createdAt: now, appliedAt: null,
-    })
-    // 普通性格/关系变化需要多条证据；重大事件可以单条触发，但要求更高置信度。
+    const proposedValue = clip(draft.proposedValue, 4_000)
     const impact = draft.impact === 'major' ? 'major' : 'minor'
+    if (!path || !proposedValue || !sourceEntryIds.length) return
+
+    // Merge repeated proposals for one setting path before evaluating them.
+    const candidates = await this.dbGet('interlude_state_patch', {
+      storyId: story.id, participantId, target: draft.target, path,
+    }) as StatePatchProposal[]
+    const matching = candidates.filter(candidate => patchClaimsMatch(candidate.proposedValue, proposedValue))
+    if (matching.some(candidate => candidate.status === 'applied' || candidate.status === 'compacted')) return
+    const candidate = matching.find(item => item.status === 'proposed')
+    const mergedSourceEntryIds = Array.from(new Set([
+      ...(candidate?.sourceEntryIds ?? []), ...sourceEntryIds,
+    ])).slice(0, 80)
+    const sourceRows = await this.dbGet('interlude_script_entry', {
+      storyId: story.id, id: { $in: mergedSourceEntryIds },
+    }) as ScriptEntry[]
+    const evidence = statePatchEvidence(sourceRows, story.setting.timezone)
+    const minimumTurns = Math.max(3, this.memoryConfig.statePatchMinTurns ?? this.memoryConfig.statePatchMinEvidence)
+    const minimumDays = Math.max(1, this.memoryConfig.statePatchMinDays ?? 2)
     const minimum = impact === 'major' ? this.memoryConfig.majorStatePatchConfidenceThreshold : this.memoryConfig.statePatchConfidenceThreshold
+    const mergedConfidence = Math.max(candidate?.confidence ?? 0, confidence)
+    const mergedEvidenceText = mergeNote(candidate?.evidence, draft.evidence)
+    const proposal = candidate ?? await this.dbCreate('interlude_state_patch', {
+      storyId: story.id, participantId, target: draft.target, path, proposedValue,
+      evidence: clip(mergedEvidenceText, 4_000), confidence: mergedConfidence, impact,
+      status: 'proposed', sourceEntryIds: mergedSourceEntryIds, createdAt: now, appliedAt: null,
+    })
+    if (candidate?.id) {
+      await this.dbSet('interlude_state_patch', { id: candidate.id }, {
+        evidence: clip(mergedEvidenceText, 4_000), confidence: mergedConfidence, impact: candidate.impact === 'major' || impact === 'major' ? 'major' : 'minor', sourceEntryIds: mergedSourceEntryIds,
+      })
+    }
+
+    // Ordinary changes require independent narrative turns on different days.
     if (!this.memoryConfig.autoApplyStatePatches || (impact === 'major' && !this.memoryConfig.allowMajorStateChanges)) return
-    if (confidence < minimum || (impact !== 'major' && sourceEntryIds.length < this.memoryConfig.statePatchMinEvidence)) return
+    const stableEvidence = impact === 'major'
+      ? mergedConfidence >= minimum
+      : mergedConfidence >= minimum && evidence.turns >= minimumTurns && evidence.days >= minimumDays
+    if (!stableEvidence) {
+      this.reportOperation('diagnostic', 'debug', story, 'advance',
+        'Overlay 候选继续累计 目标=%s/%s 回合=%d/%d 日期=%d/%d', draft.target, path, evidence.turns, minimumTurns, evidence.days, minimumDays)
+      return
+    }
+
+    const cooldownHours = Math.max(1, this.memoryConfig.statePatchCooldownHours ?? 72)
+    const recentApplied = candidates
+      .filter(item => item.status === 'applied' || item.status === 'compacted')
+      .map(item => item.appliedAt ?? item.createdAt)
+      .sort((left, right) => right.getTime() - left.getTime())[0]
+    if (recentApplied && now.getTime() - recentApplied.getTime() < cooldownHours * Time.hour) {
+      this.reportOperation('diagnostic', 'debug', story, 'advance',
+        'Overlay 冷却中，候选保留 目标=%s/%s 冷却=%d小时', draft.target, path, cooldownHours)
+      return
+    }
+
     const overlay = { ...(story.state.settingOverlay ?? {}) }
     if (draft.target === 'character') {
       if (draft.path.includes('trait')) overlay.characterTraits = Array.from(new Set([...(overlay.characterTraits ?? []), clip(draft.proposedValue, 500)])).slice(-30)
@@ -2914,7 +3351,7 @@ export class InterludeService extends Service {
   }
 
   private async getStory(id: string) {
-    const story = (await this.ctx.database.get('interlude_story', { id }))[0]
+    const story = (await this.dbGet('interlude_story', { id }))[0]
     if (!story) throw new Error(`Interlude story not found: ${id}`)
     return story
   }
@@ -2937,6 +3374,34 @@ export class InterludeService extends Service {
     return run
   }
 
+  /**
+   * A SQLite/sql.js read can fail during the same short filesystem hiccup as a
+   * write. Reads stay concurrent for normal performance; only transient driver
+   * errors receive a small bounded retry instead of aborting a user turn.
+   */
+  private async dbRead<T>(task: () => Promise<T>) {
+    const delays = [50, 125, 250]
+    for (let attempt = 0; ; attempt++) {
+      try {
+        return await task()
+      } catch (error) {
+        if (attempt >= delays.length || !isTransientDatabaseError(error)) {
+          if (isTransientDatabaseError(error)) {
+            this.serviceLogger.warn('SQLite 读取连续失败，已停止重试：%s', error)
+          }
+          throw error
+        }
+        const delay = delays[attempt] + Math.floor(Math.random() * 25)
+        this.serviceLogger.debug('SQLite 读取暂时失败，%dms 后重试（第 %d 次）：%s', delay, attempt + 1, error)
+        await new Promise(resolve => setTimeout(resolve, delay))
+      }
+    }
+  }
+
+  private dbGet(table: string, query: unknown, options?: unknown): Promise<any[]> {
+    return this.dbRead(() => this.ctx.database.get(table as never, query as never, options as never) as Promise<any[]>)
+  }
+
   private async retryDbWrite<T>(task: () => Promise<T>) {
     for (let attempt = 0; ; attempt++) {
       try {
@@ -2947,7 +3412,12 @@ export class InterludeService extends Service {
         // logging every transient attempt as a warning makes normal file
         // flush contention look like a fatal HDSI failure. Keep the retry
         // bounded, add a little jitter, and only warn on the final failure.
-        if (attempt >= 7 || !isTransientDatabaseError(error)) throw error
+        if (attempt >= 7 || !isTransientDatabaseError(error)) {
+          if (isTransientDatabaseError(error)) {
+            this.serviceLogger.warn('SQLite 写入连续失败，已停止重试：%s', error)
+          }
+          throw error
+        }
         const delays = [100, 250, 500, 1_000, 2_000, 3_000, 5_000]
         const baseDelay = delays[attempt] ?? 5_000
         const delay = baseDelay + Math.floor(Math.random() * Math.min(250, baseDelay / 4))
@@ -2978,7 +3448,7 @@ export class InterludeService extends Service {
     if (!isRecord(data)) return undefined
     const storyId = typeof data.storyId === 'string' ? data.storyId : ''
     if (!storyId) return undefined
-    const rows = await this.ctx.database.get(table as never, { storyId } as never, { limit: 100 } as never) as any[]
+    const rows = await this.dbGet(table, { storyId }, { limit: 100 })
     return rows.find(row => {
       if (table === 'interlude_intent') {
         return row.participantId === data.participantId
@@ -3054,6 +3524,66 @@ function isOneBotPlatform(platform: string | undefined) {
     || value.startsWith('qq:onebot:')
 }
 
+function extractSessionImageSources(session: Session) {
+  const raw = String(session.content ?? '')
+  const sources: string[] = []
+  const add = (value: unknown, kind: 'url' | 'file' | 'adapter-url' = 'url') => {
+    const source = String(value ?? '').trim()
+    if (!source || sources.includes(source)) return
+    if (source.length > 8 * 1024 * 1024) return
+    if (/^https?:\/\//i.test(source)) sources.push(kind === 'adapter-url' ? `onebot-url:${source}` : source)
+    else if (/^data:image\//i.test(source)) sources.push(source)
+    else if (kind === 'file') sources.push(`onebot-file:${source}`)
+  }
+  const visit = (element: any) => {
+    if (!element) return
+    const type = String(element.type ?? '').toLowerCase()
+    if (type === 'img' || type === 'image') {
+      const src = element.attrs?.src ?? element.attrs?.url ?? element.data?.src ?? element.data?.url
+      if (src) add(src)
+      else add(element.attrs?.file ?? element.data?.file, 'file')
+    }
+    for (const child of element.children ?? []) visit(child)
+  }
+  // Session.elements is adapter-owned and can be reused or enriched by other
+  // middleware. Parse this message's raw content only, otherwise an old image
+  // element may be accidentally attached to a later text-only turn.
+  try { for (const element of h.parse(raw) as any[]) visit(element) } catch {}
+  if (!sources.length) {
+    const pattern = /<(?:img|image)\b[^>]*(?:src|url)=["']([^"']+)["'][^>]*>/gi
+    for (let match = pattern.exec(raw); match; match = pattern.exec(raw)) add(match[1])
+  }
+  // OneBot/NapCat may leave a CQ image segment in the raw message instead of
+  // converting it to an HTML image element. Prefer its CDN URL; if only the
+  // file token is present, keep that token so the current bot can call
+  // get_image(file) without trusting arbitrary user URLs.
+  const cqPattern = /\[CQ:image,([^\]]+)\]/gi
+  for (let match = cqPattern.exec(raw); match; match = cqPattern.exec(raw)) {
+    const fields: Record<string, string> = {}
+    for (const part of match[1].split(',')) {
+      const index = part.indexOf('=')
+      if (index > 0) fields[part.slice(0, index).trim().toLowerCase()] = part.slice(index + 1).trim()
+    }
+    add(fields.url || fields.cache_url, 'adapter-url')
+    if (!fields.url && !fields.cache_url) add(fields.file, 'file')
+  }
+  return sources
+}
+
+function guessImageMime(bytes: Buffer, hinted?: unknown) {
+  const hint = String(hinted ?? '').toLowerCase()
+  if (hint.startsWith('image/')) return hint
+  if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return 'image/jpeg'
+  if (bytes.length >= 8 && bytes.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))) return 'image/png'
+  if (bytes.length >= 6 && (bytes.subarray(0, 6).toString() === 'GIF87a' || bytes.subarray(0, 6).toString() === 'GIF89a')) return 'image/gif'
+  if (bytes.length >= 12 && bytes.subarray(0, 4).toString() === 'RIFF' && bytes.subarray(8, 12).toString() === 'WEBP') return 'image/webp'
+  return ''
+}
+
+function isAnimatedImageMime(mime: string) {
+  return mime === 'image/gif' || mime === 'image/webp' || mime === 'image/apng'
+}
+
 function sessionGroupId(session: Session) {
   const raw = String((session as any).guildId || session.channelId || '')
   return normalizeGroupId(raw)
@@ -3123,7 +3653,7 @@ function isEnabledAccount(accounts: OneBotAccountRule[] | undefined, qq: string)
   return (accounts ?? []).some(account => account.enabled !== false && normalizeAccountId(account.qq) === normalized)
 }
 
-function normalizeDecision(raw: NarrativeDecision, from: Date, now: Date, permitMessages: boolean, runtime: RuntimeConfig, shared: SharedStoryConfig, currentParticipantId: string, permittedParticipantIds: Set<string>, phase: NarrativeRequest['phase'] = 'advance', memory?: MemoryConfig) {
+function normalizeDecision(raw: NarrativeDecision, from: Date, now: Date, permitMessages: boolean, runtime: RuntimeConfig, shared: SharedStoryConfig, currentParticipantId: string, permittedParticipantIds: Set<string>, phase: NarrativeRequest['phase'] = 'advance', memory?: MemoryConfig, refreshContinuity = false) {
   const script = typeof raw?.script === 'string'
     ? raw.script.trim().slice(0, runtime.maxScriptCharacters)
     : ''
@@ -3155,14 +3685,30 @@ function normalizeDecision(raw: NarrativeDecision, from: Date, now: Date, permit
   // explicit crossConversationActions field. The legacy `messages` array is
   // not accepted because it has no event semantics or delivery guarantee.
   const messages: OutgoingMessageDraft[] = []
+  const proactive = phase === 'advance'
   const crossConversationActions = permitMessages && shared.allowCrossConversationMessages && Array.isArray(raw?.crossConversationActions)
     ? raw.crossConversationActions
-      .map(action => normalizeConversationAction(action, runtime, permittedParticipantIds, currentParticipantId, now))
+      .map(action => normalizeConversationAction(action, runtime, permittedParticipantIds, currentParticipantId, now, proactive))
       .filter((action): action is NonNullable<ReturnType<typeof normalizeConversationAction>> => !!action)
       .slice(0, Math.max(0, shared.maxCrossConversationActions))
     : []
   const statePatch = isRecord(raw?.statePatch) ? pickParticipantStatePatch(raw.statePatch) : undefined
-  return { script, interaction, entries, memories, intents, intentUpdates, browserIntents, messages, statePatch, crossConversationActions }
+  const continuity = refreshContinuity ? normalizeContinuitySnapshot(raw?.continuity) : undefined
+  return { script, interaction, continuity, entries, memories, intents, intentUpdates, browserIntents, messages, statePatch, crossConversationActions }
+}
+
+function normalizeContinuitySnapshot(value: unknown): ContinuitySnapshot | undefined {
+  if (!isRecord(value)) return undefined
+  const text = (item: unknown, limit: number) => typeof item === 'string' ? clip(item, limit).trim() : ''
+  const list = (item: unknown, limit: number) => Array.isArray(item)
+    ? item.map(value => text(value, limit)).filter(Boolean).slice(0, 5)
+    : []
+  const current = text(value.current, 500)
+  const next = list(value.next, 300).slice(0, 3)
+  const recent = list(value.recent, 300)
+  const salient = list(value.salient, 400)
+  if (!current && !next.length && !recent.length && !salient.length) return undefined
+  return { current, next, recent, salient }
 }
 
 /**
@@ -3403,16 +3949,21 @@ function hasCompactionEvidence(sourceEntryIds: number[] | undefined, entries: Sc
   return sourceEntryIds.some(id => ids.has(id))
 }
 
-function normalizeConversationAction(value: unknown, runtime: RuntimeConfig, permittedParticipantIds: Set<string>, currentParticipantId: string, now = new Date()) {
+function normalizeConversationAction(value: unknown, runtime: RuntimeConfig, permittedParticipantIds: Set<string>, currentParticipantId: string, now = new Date(), proactive = false) {
   if (!isRecord(value) || typeof value.participantId !== 'string' || !value.participantId || value.participantId === currentParticipantId) return undefined
   if (!permittedParticipantIds.has(value.participantId) || (value.mode !== 'immediate' && value.mode !== 'delayed')) return undefined
   const content = typeof value.content === 'string' ? value.content.trim().slice(0, runtime.maxMessageCharacters) : ''
   if (!content) return undefined
-  if (value.mode === 'immediate') return { participantId: value.participantId, mode: value.mode, content }
+  const willingness = typeof value.willingness === 'number' && Number.isFinite(value.willingness)
+    ? clampNumber(value.willingness, 0, 0, 1)
+    : undefined
+  if (proactive && (willingness === undefined || willingness < (runtime.proactiveWillingnessThreshold ?? 0.65))) return undefined
+  const reason = typeof value.reason === 'string' ? clip(value.reason, 300) : undefined
+  if (value.mode === 'immediate') return { participantId: value.participantId, mode: value.mode, content, ...(willingness === undefined ? {} : { willingness }), ...(reason ? { reason } : {}) }
   const sendAt = toDate(value.sendAt)
   const delay = sendAt?.getTime() - now.getTime()
   if (!sendAt || delay < runtime.minimumDelayedReplySeconds * 1_000 || delay > runtime.maximumDelayedReplyMinutes * Time.minute) return undefined
-  return { participantId: value.participantId, mode: value.mode, content, sendAt: sendAt.toISOString() }
+  return { participantId: value.participantId, mode: value.mode, content, sendAt: sendAt.toISOString(), ...(willingness === undefined ? {} : { willingness }), ...(reason ? { reason } : {}) }
 }
 
 function permittedOrGlobal(value: unknown, fallback: string, permittedParticipantIds: Set<string>) {
@@ -3457,6 +4008,7 @@ function normalizeStoryState(value: unknown): StoryState {
   const record = isRecord(value) ? value : {}
   const overlay = isRecord(record.settingOverlay) ? record.settingOverlay : {}
   const automation = isRecord(record.automation) ? record.automation : {}
+  const continuity = isRecord(record.continuitySnapshot) ? normalizeContinuitySnapshot(record.continuitySnapshot) : undefined
   return {
     settingOverlay: {
       characterProfile: typeof overlay.characterProfile === 'string' ? overlay.characterProfile : undefined,
@@ -3468,11 +4020,20 @@ function normalizeStoryState(value: unknown): StoryState {
     },
     activeSceneId: typeof record.activeSceneId === 'number' ? record.activeSceneId : undefined,
     activeArcId: typeof record.activeArcId === 'number' ? record.activeArcId : undefined,
+    continuitySnapshot: continuity,
+    narrativeUpdateCount: Math.max(0, Math.floor(typeof record.narrativeUpdateCount === 'number' ? record.narrativeUpdateCount : 0)),
+    lastContinuityUpdateAt: typeof record.lastContinuityUpdateAt === 'string' ? record.lastContinuityUpdateAt : undefined,
     automation: {
       quietUntil: typeof automation.quietUntil === 'string' ? automation.quietUntil : undefined,
       nextAdvanceAt: typeof automation.nextAdvanceAt === 'string' ? automation.nextAdvanceAt : undefined,
       lastAutoAdvanceAt: typeof automation.lastAutoAdvanceAt === 'string' ? automation.lastAutoAdvanceAt : undefined,
       lastUserMessageAt: typeof automation.lastUserMessageAt === 'string' ? automation.lastUserMessageAt : undefined,
+      conversationFollowUpAt: Array.isArray(automation.conversationFollowUpAt)
+        ? automation.conversationFollowUpAt.filter(item => typeof item === 'string').slice(0, 8)
+        : [],
+      conversationFollowUpParticipantId: typeof automation.conversationFollowUpParticipantId === 'string'
+        ? clip(automation.conversationFollowUpParticipantId, 255)
+        : undefined,
     },
   }
 }
@@ -3670,4 +4231,74 @@ function mergeNote(existing: string | undefined, next: string) {
   if (!existing) return value
   if (normalizeFact(existing).includes(normalizeFact(value))) return existing
   return `${existing}\n${value}`.slice(-6_000)
+}
+
+function patchClaimsMatch(left: string, right: string) {
+  const a = normalizeFact(left).replace(/[，。！？、,.!?；;:：]/g, '')
+  const b = normalizeFact(right).replace(/[，。！？、,.!?；;:：]/g, '')
+  if (!a || !b) return false
+  if (a === b) return true
+  // Allow small wording variations, while avoiding very short claims that
+  // could incorrectly merge contradictory changes.
+  return Math.min(a.length, b.length) >= 8 && (a.includes(b) || b.includes(a))
+}
+
+function statePatchEvidence(entries: ScriptEntry[], timezone: string) {
+  const narrative = entries.filter(entry => entry.kind === 'script' || entry.actor === 'narrator')
+  // Use the narrative timestamp as the turn key. Duplicate rows created at
+  // the same instant must not count as independent evidence.
+  const turns = new Set(narrative.map(entry => entry.occurredAt.getTime())).size
+  const days = new Set(narrative.map(entry => calendarDayKey(entry.occurredAt, timezone))).size
+  return { turns, days }
+}
+
+function calendarDayKey(value: Date, timezone: string) {
+  try {
+    return new Intl.DateTimeFormat('en-CA', { timeZone: timezone || 'UTC', year: 'numeric', month: '2-digit', day: '2-digit' }).format(value)
+  } catch {
+    return value.toISOString().slice(0, 10)
+  }
+}
+
+function startOfUtcWindow(value: Date, windowDays: number) {
+  const size = Math.max(1, Math.floor(windowDays))
+  const epochDay = Math.floor(value.getTime() / Time.day)
+  return new Date(Math.floor(epochDay / size) * size * Time.day)
+}
+
+function startOfUtcMonth(value: Date) {
+  return new Date(Date.UTC(value.getUTCFullYear(), value.getUTCMonth(), 1))
+}
+
+function groupOverlayPatches(patches: StatePatchProposal[], windowDays = 5) {
+  const groups = new Map<string, { participantId: string; target: StatePatchProposal['target']; from: Date; to: Date; patches: StatePatchProposal[] }>()
+  for (const patch of patches) {
+    const from = startOfUtcWindow(patch.appliedAt ?? patch.createdAt, windowDays)
+    const key = `${patch.participantId}|${patch.target}|${from.toISOString()}`
+    const group = groups.get(key) ?? { participantId: patch.participantId, target: patch.target, from, to: new Date(from.getTime() + windowDays * Time.day), patches: [] }
+    group.patches.push(patch)
+    groups.set(key, group)
+  }
+  return [...groups.values()]
+}
+
+function groupOverlaySnapshots(snapshots: OverlaySnapshot[], windowDays = 10) {
+  const groups = new Map<string, { participantId: string; target: OverlaySnapshot['target']; from: Date; to: Date; snapshots: OverlaySnapshot[] }>()
+  for (const snapshot of snapshots) {
+    const from = startOfUtcWindow(snapshot.periodEnd, windowDays)
+    const key = `${snapshot.participantId}|${snapshot.target}|${from.toISOString()}`
+    const group = groups.get(key) ?? { participantId: snapshot.participantId, target: snapshot.target, from, to: new Date(from.getTime() + windowDays * Time.day), snapshots: [] }
+    group.snapshots.push(snapshot)
+    groups.set(key, group)
+  }
+  return [...groups.values()]
+}
+
+function normalizeMajorEvents(value: unknown, patches: StatePatchProposal[], snapshots: OverlaySnapshot[] = []) {
+  const modelEvents = Array.isArray(value) ? value.filter(item => typeof item === 'string').map(item => clip(item, 600)) : []
+  const retained = [
+    ...snapshots.flatMap(snapshot => snapshot.majorEvents ?? []),
+    ...patches.filter(patch => patch.impact === 'major').map(patch => clip(patch.proposedValue || patch.evidence, 600)),
+  ]
+  return Array.from(new Set([...retained, ...modelEvents].filter(Boolean))).slice(-20)
 }

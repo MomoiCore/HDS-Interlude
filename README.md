@@ -9,7 +9,7 @@
 
 > 聊天在幕前发生，生活在幕间继续。
 
-> 当前版本：0.1.1-beta4-refactor。请先在测试环境中验证服务商、权限、网页浏览和数据清理流程，并妥善保管 API Key 与私聊数据。
+> 当前版本：0.1.1-beta6。请先在测试环境中验证服务商、权限、网页浏览和数据清理流程，并妥善保管 API Key 与私聊数据。
 
 HDS Interlude 是基于 Koishi 的多人共享主剧本聊天框架。每个机器人角色对应一份持续更新的剧本状态；消息只是其中可见的一段，日程、关系、事件和未完成的心事会继续留在剧本中。多个 QQ 账号可作为同一剧本中的不同参与者。
 
@@ -96,6 +96,12 @@ sequenceDiagram
 因此，一条消息不会触发“先补写一次、再判断回复一次”的两次主模型调用。
 
 ## 4. 主叙事模型的输入与输出
+
+### 原生识图（OpenAI-compatible）
+
+在 Console 的“模型 → 原生图片输入”中开启 `enabled` 后，私聊中的图片会和同一时间段内的文字合并为一个用户事件，并以 OpenAI Chat Completions 的多模态 `image_url` 块发送给主叙事模型。OneBot/NapCat 的电脑 JPG、手机图片和 CQ 图片码统一通过当前 bot 的 `get_image` 解析；图片不会写入剧本、记忆或日志正文。GIF、动态 WebP、APNG 会在可用时由 Puppeteer 截取代表帧，不调用额外图片描述模型。
+
+普通文字中的 URL 不会被下载。读取失败、非图片响应或超过 4 MiB 的图片会被跳过，文字消息仍会正常进入写作流程；失败时不会向主模型注入“图片已发送”的占位描述。
 
 ### 输入
 
@@ -260,9 +266,12 @@ interaction.reply.mode 的含义：
 
 插件只在满足门槛时将提案标记 applied 并更新 state.settingOverlay：
 
-- 普通变化需要达到 statePatchConfidenceThreshold，并且至少具有 statePatchMinEvidence 条证据。
-- 重大变化允许较少证据，但必须达到更高的 majorStatePatchConfidenceThreshold。
-- 未满足条件的提案仍被保留为 proposed，便于审计或后续人工处理。
+- 普通变化需要达到 `statePatchConfidenceThreshold`，至少来自 3 个不同剧本回合，并跨越至少 2 个日历日。
+- 同一路径的稳定变化应用后默认冷却 72 小时；冷却期间的新变化只保留为候选。
+- 重大变化允许较少证据，但必须达到更高的 `majorStatePatchConfidenceThreshold`。
+- 同一目标、路径和相近内容的候选会合并累计，不会每轮压缩都新增一条。
+- 未满足条件的提案仍被保留为 `proposed`，便于审计或后续继续累计。
+- 清理 overlay 时，相关的已应用状态、历史快照和待积累候选都会失效，防止旧变化在之后重新出现。
 
 这避免了“用户夸了角色一次，角色从内向变成外向”这类突变。
 
@@ -679,7 +688,7 @@ sharedStory:
 | interlude.timeline [limit] | 查看最近原始剧本 |
 | interlude.memory [limit] | 查看主回合产出的耐久记忆 |
 | interlude.context | 查看活动场景、剧情弧线、演化覆写和已检索事实 |
-| interlude.compact | 立即请求一次记忆压缩 |
+| interlude.compact | 立即整理剧本、事实、状态提案，并执行 overlay 维护 |
 | interlude.script [limit] | 管理员查看共享主剧本原始条目 |
 | interlude.script.note <content> | 管理员写入可审计的人工剧本注记 |
 | interlude.memory.facts [limit] | 管理员查看长期事实和编号 |
@@ -688,6 +697,8 @@ sharedStory:
 | interlude.memory.intents [limit] / cancel <id> | 管理员查看或取消等待中的意图 |
 | interlude.memory.patches [limit] / reject <id> | 管理员查看或拒绝设定演化提案 |
 | interlude.overlay.clear <target> | 管理员清理 character、relationship、world 或 all 的演化 overlay；随后回复 y/n |
+| interlude.overlay.status | 管理员查看当前 overlay、候选提案和压缩快照 |
+| interlude.overlay.compact | 管理员只合并/压缩已应用 overlay，不整理普通剧本记忆 |
 | interlude.database.clear | 管理员清空 HDSI 自有 SQLite 表；随后回复 y/n |
 | interlude.purge.all | 管理员彻底重置所有平台的剧本、派生记忆和 Canon；随后回复 y/n |
 | interlude.purge.platform <platform> | 管理员清空并归档指定平台的全部故事；随后回复 y/n |
@@ -713,6 +724,15 @@ sharedStory:
 ctx.interlude.setNarrator(myNarrativeProvider)
 ctx.interlude.setCompactor(myNarrativeCompactor)
 ~~~
+
+## 0.1.1-beta6：overlay 生命周期与管理员维护
+
+- 普通人格和关系变化改为候选提案，必须跨多个剧本回合和日期后才会进入长期 overlay。
+- 同一目标、参与者、路径和相近内容的提案会合并累计，避免每次记忆整理都新增重复变化。
+- 增加同一路径 overlay 冷却时间，默认 72 小时。
+- 新增 `interlude.overlay.status` 和 `interlude.overlay.compact`。
+- `interlude.overlay.clear` 现在会同时使对应的待积累候选、已应用记录和历史压缩快照失效，防止旧设定清理后重新出现。
+- 补充 overlay 生命周期、状态提案门槛和维护指令文档。
 
 ## 0.1.1-beta4-refactor：运行日志与任务可观测性
 

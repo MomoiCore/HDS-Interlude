@@ -1,5 +1,5 @@
 import { Context } from 'koishi';
-import { CompactionDecision, CompactionRequest, GroupGateDecision, GroupGateRequest, NarrativeDecision, NarrativeProvider, NarrativeCompactor, NarrativeEmbedder, NarrativeRequest } from './types';
+import { CompactionDecision, CompactionRequest, GroupGateDecision, GroupGateRequest, NarrativeDecision, NarrativeProvider, OverlayCompactionDecision, OverlayCompactionRequest, NarrativeCompactor, NarrativeEmbedder, NarrativeRequest } from './types';
 export type ProviderResponseFormat = 'json-object' | 'prompt-only';
 export type ProviderStrategy = 'priority' | 'round-robin';
 export interface ProviderConfig {
@@ -42,6 +42,11 @@ export interface ModelConfig {
     compaction?: CompactionConfig;
     embedding?: EmbeddingConfig;
     groupGate?: GroupGateConfig;
+    /** OpenAI-compatible native image inputs for the current private-message turn. */
+    vision?: VisionConfig;
+}
+export interface VisionConfig {
+    enabled: boolean;
 }
 export interface ModelProfile {
     id: string;
@@ -107,6 +112,7 @@ export declare class SilentNarrator implements NarrativeProvider {
 }
 export declare class SilentCompactor implements NarrativeCompactor {
     compact(): Promise<CompactionDecision>;
+    compactOverlay(): Promise<OverlayCompactionDecision>;
 }
 /** A no-op embedder lets memory retrieval fall back to rule-based ranking. */
 export declare class SilentEmbedder implements NarrativeEmbedder {
@@ -138,6 +144,7 @@ export declare class OpenAICompatibleNarrator implements NarrativeProvider {
     decide(request: NarrativeRequest): Promise<NarrativeDecision>;
     gateGroup(request: GroupGateRequest): Promise<GroupGateDecision>;
     compact(request: CompactionRequest): Promise<CompactionDecision>;
+    compactOverlay(request: OverlayCompactionRequest): Promise<OverlayCompactionDecision>;
     private selectProviders;
     private requestProvider;
 }

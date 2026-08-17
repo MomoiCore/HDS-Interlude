@@ -1,5 +1,5 @@
 import { Context, Schema, Session } from 'koishi'
-import { CompactionConfig, EmbeddingConfig, FailoverConfig, GroupGateConfig, ModelConfig, ProviderConfig } from './narrator'
+import { CompactionConfig, EmbeddingConfig, FailoverConfig, GroupGateConfig, ModelConfig, ProviderConfig, VisionConfig } from './narrator'
 import { BrowserConfig, Config as InterludeConfig, GroupChatRule, InterludeService, LoggingConfig, MemoryConfig, OneBotAccountRule, OneBotNapCatConfig, RestWindow, RuntimeConfig, SharedStoryConfig, StoryDefaults } from './service'
 import { StorySetting } from './types'
 
@@ -86,6 +86,10 @@ const GroupGate: Schema<GroupGateConfig> = Schema.object({
   prompt: Schema.string().role('textarea').default('').description('追加给群聊快速判断模型的自定义提示词。'),
 })
 
+const Vision: Schema<VisionConfig> = Schema.object({
+  enabled: Schema.boolean().default(false).description('原生识图开关。开启后，当前私聊图片会作为多模态输入发送给所选 OpenAI-compatible 主模型；模型本身必须支持视觉输入。图片不会写入剧本数据库。'),
+}).collapse(true)
+
 const Model: Schema<ModelConfig> = Schema.object({
   models: Schema.array(ModelProfile).role('table').default([]).description('一次性登记所有可用模型；各调用功能通过模型预设 ID 引用。'),
   mainModelId: Schema.string().default('').description('主叙事模型预设 ID；留空时兼容使用 providers 的默认模型。'),
@@ -104,6 +108,7 @@ const Model: Schema<ModelConfig> = Schema.object({
   stylePrompt: Schema.string().role('textarea').default('Use restrained, realistic prose with concrete daily details, natural pauses, and no forced drama.').description('全局叙事文风；故事级 style 可进一步覆盖。'),
   embedding: Embedding.default({ enabled: false, modelId: '', providerId: '', endpoint: '', model: '', dimensions: 0, timeout: 10_000, maxInputCharacters: 4_000, backfillBatchSize: 5 }).description('长期事实的语义召回设置。'),
   groupGate: GroupGate.default({ enabled: false, modelId: '', providerId: '', model: '', temperature: 0.2, topP: 1, maxTokens: 500, timeout: 10_000, threshold: 0.65, prompt: '' }).description('群聊进入主叙事模型前的快速筛选模型。'),
+  vision: Vision.default({ enabled: false }).description('OpenAI-compatible 原生图片输入。'),
   compaction: (Schema.object({
     modelId: Schema.string().default('').description('模型预设 ID；填写后优先使用 model.models 中对应的模型。'),
     enabled: Schema.boolean().default(true).description('启用后台剧本压缩与长期事实提取。'),
@@ -143,6 +148,7 @@ const Runtime: Schema<RuntimeConfig> = Schema.object({
   autoCreate: Schema.boolean().default(false).description('无主剧本时是否自动创建；关闭后需先执行 interlude.init。'),
   ignoreCommandMessages: Schema.boolean().default(true).description('是否跳过 interlude.* 管理命令，避免进入剧本。'),
   allowProactiveMessages: Schema.boolean().default(false).description('是否允许无新消息时向参与者主动发送可见消息。'),
+  proactiveWillingnessThreshold: Schema.number().min(0).max(1).step(0.05).default(0.65).description('主动联系意愿门槛。自动推进时由主模型为每次联系给出 0~1 的意愿值，低于此值不发送；没有固定冷却。'),
   sweepIntervalMinutes: Schema.natural().min(1).max(1_440).default(5).description('后台扫描周期；仅用于发现到期任务，不代表每轮都调用模型。'),
   minimumAdvanceMinutes: Schema.natural().min(1).max(10_080).default(30).description('手动“interlude.advance”的最小有效补写间隔；到期计划和对话后的短期补写不受此限制。'),
   maxStoriesPerSweep: Schema.natural().min(1).max(1_000).default(20).description('单轮后台扫描最多处理的主剧本数量。'),
@@ -191,9 +197,12 @@ const Memory: Schema<MemoryConfig> = Schema.object({
   sceneCharacterThreshold: Schema.natural().min(500).max(200_000).default(8_000).description('未压缩剧本字符数达到此值时触发整理。'),
   recentEntryLimit: Schema.natural().min(1).max(200).default(30).description('每次主模型请求附带的最近原始条目数。'),
   factLimit: Schema.natural().min(1).max(200).default(20).description('每次主模型请求附带的长期事实数。'),
-  statePatchConfidenceThreshold: Schema.number().min(0).max(1).default(0.82).description('普通设定变更的最低置信度。'),
+  statePatchConfidenceThreshold: Schema.number().min(0).max(1).default(0.82).description('普通设定变更的最低置信度；低于此值只保留为候选。'),
   majorStatePatchConfidenceThreshold: Schema.number().min(0).max(1).default(0.95).description('重大设定变更的最低置信度。'),
-  statePatchMinEvidence: Schema.natural().min(1).max(20).default(2).description('普通设定变更至少需要的独立证据条数。'),
+  statePatchMinEvidence: Schema.natural().min(1).max(20).default(3).description('兼容旧配置；普通变化至少需要的证据回合数下限。运行时不会低于 3。'),
+  statePatchMinTurns: Schema.natural().min(3).max(20).default(3).description('普通人格或关系变化至少需要来自多少个不同剧本回合。'),
+  statePatchMinDays: Schema.natural().min(1).max(30).default(2).description('普通变化至少要跨越多少个日历日；重大事件不受此限制。'),
+  statePatchCooldownHours: Schema.natural().min(1).max(720).default(72).description('同一人格或关系路径应用一次长期变化后，多少小时内不再应用新的变化。'),
   maxFactsPerStory: Schema.natural().min(10).max(2_000).default(200).description('单个主剧本保留的长期事实总量上限。'),
   maxStoriesPerCompactionRun: Schema.natural().min(1).max(1_000).default(20).description('单轮后台整理最多处理的主剧本数。'),
   compactionEntryLimit: Schema.natural().min(1).max(500).default(80).description('压缩模型单次读取的最大剧本条目数。'),
@@ -213,6 +222,13 @@ const Memory: Schema<MemoryConfig> = Schema.object({
   activeConsequencePromptLimit: Schema.natural().min(1).max(20).default(6).description('单次主模型写作最多携带几条仍在生效的剧情余波。数值越高，连续性更强，但会增加少量上下文。'),
   activeConsequenceMaxDays: Schema.natural().min(1).max(30).default(7).description('一条剧情余波最长保留多少天。到期后会自然淡出；它不用于永久修改角色设定。'),
   activeConsequenceDefaultStrength: Schema.number().min(0).max(1).step(0.05).default(0.55).description('剧情余波未写明强度时的默认影响程度。0 表示极轻微，1 表示会明显影响主角近期生活。'),
+  overlayCompressionEnabled: Schema.boolean().default(true).description('将较久以前、已应用的人设和关系变化压缩为分层摘要；不会改变 Canon 或删除原始补丁。'),
+  overlayRecentDays: Schema.natural().min(1).max(14).default(2).description('最近多少天的 overlay 变化保留原始细节，不进入压缩。默认 2 天。'),
+  overlayMonthlyAfterDays: Schema.natural().min(5).max(180).default(10).description('超过多少天后，将短期摘要合并为长期状态。默认 10 天。'),
+  overlayWeeklyWindowDays: Schema.natural().min(1).max(14).default(5).description('短期 overlay 摘要的合并窗口。默认每 5 天合并一次。'),
+  overlayMonthlyWindowDays: Schema.natural().min(5).max(30).default(10).description('长期 overlay 状态的合并窗口。默认每 10 天合并一次。'),
+  overlayWeeklySummaryCharacters: Schema.natural().min(300).max(8_000).default(1_600).description('单个七天 overlay 摘要的最大字符数。'),
+  overlayMonthlySummaryCharacters: Schema.natural().min(300).max(12_000).default(2_400).description('单个长期 overlay 摘要的最大字符数。'),
 })
 
 const StoryDefaults: Schema<StoryDefaults> = Schema.object({
@@ -527,6 +543,32 @@ function registerCommands(ctx: Context, service: InterludeService) {
       return `已清理 ${normalized} overlay${participantNote}；剧本、长期事实和普通记忆均未删除。`
     })
 
+  ctx.command('interlude.overlay.status', '管理员：查看当前 overlay、待积累提案和压缩归档状态')
+    .action(async ({ session }) => {
+      if (!requireManager(service, session)) return '无权限：当前账号不是 HDSI 管理员。'
+      const story = await requireStory(service, session)
+      if (typeof story === 'string') return story
+      const status = await service.adminOverlayStatus(story.id)
+      const overlay = JSON.stringify(status.state)
+      return [
+        `当前全局 overlay：${overlay === '{}' ? '空' : overlay}`,
+        `待积累提案：${status.proposed.length} 条（需要跨多个剧本回合和日期后才会应用）`,
+        `已应用/已归档提案：${status.applied.length} 条`,
+        `已清理提案：${status.cleared.length} 条`,
+        `overlay 压缩快照：${status.snapshots.length} 条`,
+        `参与者关系 overlay：${status.participantOverlays.length} 个`,
+      ].join('\n')
+    })
+
+  ctx.command('interlude.overlay.compact', '管理员：只合并和压缩已应用的 overlay，不整理普通剧本记忆')
+    .action(async ({ session }) => {
+      if (!requireManager(service, session)) return '无权限：当前账号不是 HDSI 管理员。'
+      const story = await requireStory(service, session)
+      if (typeof story === 'string') return story
+      const changed = await service.compactOverlay(story)
+      return changed ? 'overlay 合并和压缩完成。' : '没有需要合并或压缩的 overlay。'
+    })
+
   ctx.command('interlude.database.clear', '管理员：清空 HDSI 自有 SQLite 数据表；不会删除 Koishi 用户和其它插件数据；执行前会询问 y/n')
     .action(async ({ session }) => {
       if (!requireManager(service, session)) return '无权限：当前账号不是 HDSI 管理员。'
@@ -557,13 +599,14 @@ function registerCommands(ctx: Context, service: InterludeService) {
         : `没有找到平台 ${normalized} 的 HDSI 剧本。`
     })
 
-  ctx.command('interlude.purge.range <from:text> <to:text>', '管理员：删除时间范围内的剧本和关联记忆；时间使用 ISO-8601；执行前会询问 y/n')
+  // `text` 是 Koishi 的贪婪参数类型，会吞掉后续的结束时间；这里必须使用普通 string。
+  ctx.command('interlude.purge.range <from:string> <to:string>', '管理员：删除时间范围内的剧本和关联记忆；时间使用 ISO-8601；执行前会询问 y/n')
     .action(async ({ session }, fromText, toText) => {
       if (!requireManager(service, session)) return '当前 QQ 没有共享主剧本的管理权限。'
-      if (!await askConfirmation(session, `即将删除 ${fromText} 至 ${toText} 范围内的剧本和关联记忆。确认执行吗？(y/n)`)) return '操作已取消。'
-      const from = new Date(fromText)
-      const to = new Date(toText)
+      const from = new Date(String(fromText ?? '').trim())
+      const to = new Date(String(toText ?? '').trim())
       if (!Number.isFinite(from.getTime()) || !Number.isFinite(to.getTime()) || from > to) return '时间范围无效，请使用 ISO-8601，例如 2026-08-01T00:00:00+08:00。'
+      if (!await askConfirmation(session, `即将删除 ${from.toISOString()} 至 ${to.toISOString()} 范围内的剧本和关联记忆。确认执行吗？(y/n)`)) return '操作已取消。'
       const story = await requireStory(service, session)
       if (typeof story === 'string') return story
       await service.purgeStoryRange(story.id, from, to)

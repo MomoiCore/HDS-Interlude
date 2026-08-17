@@ -1,7 +1,7 @@
 import { Context } from 'koishi'
 import {
   InterludeArc, InterludeParticipant, InterludeScene, InterludeStory, NarrativeFact, NarrativeIntent,
-  NarrativeMemory, ScriptEntry, StatePatchProposal, WebObservation,
+  NarrativeMemory, OverlaySnapshot, ScriptEntry, StatePatchProposal, WebObservation,
 } from './types'
 
 declare module 'koishi' {
@@ -15,6 +15,7 @@ declare module 'koishi' {
     interlude_arc: InterludeArc
     interlude_fact: NarrativeFact
     interlude_state_patch: StatePatchProposal
+    interlude_overlay_snapshot: OverlaySnapshot
     interlude_web_observation: WebObservation
   }
 }
@@ -29,6 +30,7 @@ export function registerTables(ctx: Context) {
   // genuinely new tables introduced by later releases.
   if (existingTables.interlude_story) {
     if (!existingTables.interlude_web_observation) registerWebObservationTable(ctx)
+    if (!existingTables.interlude_overlay_snapshot) registerOverlaySnapshotTable(ctx)
     return
   }
 
@@ -95,6 +97,7 @@ export function registerTables(ctx: Context) {
   }, { primary: 'id', autoInc: true, indexes: ['storyId', 'status', 'confidence'] })
 
   registerWebObservationTable(ctx)
+  registerOverlaySnapshotTable(ctx)
 }
 
 /** Kept separately so an upgrade can register only this new table without
@@ -106,4 +109,15 @@ function registerWebObservationTable(ctx: Context) {
     mode: 'string(16)', query: 'text', url: 'text', title: 'text', excerpt: 'text', summary: 'text',
     status: 'string(16)', accessedAt: 'timestamp', createdAt: 'timestamp',
   }, { primary: 'id', autoInc: true, indexes: ['storyId', 'status', 'accessedAt'] })
+}
+
+/** Snapshot rows keep older overlay evolution compact without discarding the
+ * original state-patch audit trail. Registered separately for fast upgrades. */
+function registerOverlaySnapshotTable(ctx: Context) {
+  if ((ctx.model as any).tables?.interlude_overlay_snapshot) return
+  ctx.model.extend('interlude_overlay_snapshot', {
+    id: 'unsigned', storyId: 'string(255)', participantId: 'string(255)', target: 'string(32)', tier: 'string(16)',
+    periodStart: 'timestamp', periodEnd: 'timestamp', summary: 'text', majorEvents: 'json', sourcePatchIds: 'json',
+    status: 'string(16)', createdAt: 'timestamp', updatedAt: 'timestamp',
+  }, { primary: 'id', autoInc: true, indexes: ['storyId', 'status', 'target', 'periodEnd'] })
 }

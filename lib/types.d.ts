@@ -25,8 +25,19 @@ export interface StoryState {
     settingOverlay: StorySettingOverlay;
     activeSceneId?: number;
     activeArcId?: number;
+    /** Low-frequency continuity note refreshed on the first auto pass and then after every 15 successful narrative updates. */
+    continuitySnapshot?: ContinuitySnapshot;
+    narrativeUpdateCount: number;
+    lastContinuityUpdateAt?: string;
     /** 自动推进时钟；ISO 字符串便于跨进程/数据库 JSON 持久化。 */
     automation: StoryAutomationState;
+}
+/** Compact replace-in-place reminder of the protagonist's current state and notable threads. */
+export interface ContinuitySnapshot {
+    current: string;
+    next: string[];
+    recent: string[];
+    salient: string[];
 }
 /**
  * One character can maintain several relationships in the same main story.
@@ -50,6 +61,11 @@ export interface StoryAutomationState {
     nextAdvanceAt?: string;
     lastAutoAdvanceAt?: string;
     lastUserMessageAt?: string;
+    /** Short continuity passes scheduled from the latest conversation endpoint. */
+    conversationFollowUpAt?: string[];
+    /** Relationship branch whose recent conversation supplies the 10/20-minute
+     * continuity context. Omitted for ordinary background advancement. */
+    conversationFollowUpParticipantId?: string;
 }
 export interface StorySettingOverlay {
     characterProfile?: string;
@@ -141,7 +157,7 @@ export interface InterludeArc {
     updatedAt: Date;
 }
 export type StatePatchTarget = 'character' | 'world' | 'relationship';
-export type StatePatchStatus = 'proposed' | 'applied' | 'rejected';
+export type StatePatchStatus = 'proposed' | 'applied' | 'compacted' | 'rejected' | 'cleared';
 export interface StatePatchProposal {
     /**
      * 压缩器提出、插件审核的变化，而不是对 canon 的直接写入。
@@ -160,6 +176,25 @@ export interface StatePatchProposal {
     sourceEntryIds: number[];
     createdAt: Date;
     appliedAt: Date | null;
+}
+/** A compressed, auditable layer of setting evolution. Raw applied patches
+ * remain intact and are only marked compacted after a snapshot is stored. */
+export interface OverlaySnapshot {
+    id: number;
+    storyId: string;
+    participantId: string;
+    target: StatePatchTarget;
+    /** Kept as weekly/monthly for database compatibility; runtime windows are
+     * five days and ten days respectively. */
+    tier: 'weekly' | 'monthly';
+    periodStart: Date;
+    periodEnd: Date;
+    summary: string;
+    majorEvents: string[];
+    sourcePatchIds: number[];
+    status: 'active' | 'superseded';
+    createdAt: Date;
+    updatedAt: Date;
 }
 export interface NarrativeFact {
     id: number;
@@ -231,6 +266,14 @@ export interface IntentDraft {
     payload?: Record<string, unknown>;
     participantId?: string;
 }
+/** A narrator may close an active narrative consequence once the script has
+ * naturally absorbed it. Scheduled intents complete through their due-turn
+ * path, so this is deliberately limited to existing persistent context. */
+export interface IntentUpdateDraft {
+    id: number;
+    status: 'completed' | 'cancelled';
+    resolution?: string;
+}
 export interface OutgoingMessageDraft {
     participantId: string;
     content: string;
@@ -251,6 +294,10 @@ export interface ConversationActionDraft {
     mode: 'immediate' | 'delayed';
     content: string;
     sendAt?: string;
+    /** 0..1: how strongly the protagonist actually wants to initiate contact now. */
+    willingness?: number;
+    /** Short audit note explaining the concrete reason for this contact. */
+    reason?: string;
 }
 export type InteractionReplyMode = 'none' | 'immediate' | 'delayed';
 export interface NarrativeInteraction {
@@ -264,13 +311,15 @@ export interface NarrativeInteraction {
 export interface NarrativeDecision {
     /** The continuous prose written by the main narrative model. */
     script?: string;
+    /** Present only when the request explicitly asks for a low-frequency continuity refresh. */
+    continuity?: ContinuitySnapshot;
     /** The machine-readable result placed after the prose. */
     interaction?: NarrativeInteraction;
-    entries?: ScriptEntryDraft[];
     memories?: MemoryDraft[];
     intents?: IntentDraft[];
+    /** Resolves existing active-consequence intents visible in this turn. */
+    intentUpdates?: IntentUpdateDraft[];
     browserIntents?: BrowserIntentDraft[];
-    messages?: OutgoingMessageDraft[];
     /** Applies to the current participant only; world state uses compaction proposals. */
     statePatch?: Partial<ParticipantState>;
     /** Optional outbound actions aimed at other accounts in the same main story. */
@@ -281,14 +330,25 @@ export interface NarrativeDecision {
         content?: string;
     };
 }
-export type NarrativePhase = 'advance' | 'user-message' | 'intent-due';
+export type NarrativePhase = 'advance' | 'conversation-follow-up' | 'user-message' | 'intent-due';
+/** A transient native-vision attachment for the current private-message turn.
+ * It is intentionally never persisted in script entries, memories, or facts. */
+export interface NarrativeImage {
+    id: string;
+    mimeType: string;
+    dataUri: string;
+}
 export interface NarrativeRequest {
     /** 主模型只读取经过预算控制的连续性包，不读取完整历史。 */
     phase: NarrativePhase;
+    /** Refresh the compact continuity note on this turn. */
+    refreshContinuity?: boolean;
     story: InterludeStory;
     from: Date;
     now: Date;
     userMessage?: string;
+    /** Native image inputs observed in this one incoming user event only. */
+    images?: NarrativeImage[];
     /** The relationship that caused this turn; null for unattended life updates. */
     participant: InterludeParticipant | null;
     /** Other currently enrolled relationship branches, ordered by relevance. */
@@ -296,11 +356,15 @@ export interface NarrativeRequest {
     /** Sensitive details of other participants are opt-in because the model may be remote. */
     shareParticipantDetails: boolean;
     dueIntents: NarrativeIntent[];
+    /** Consequences already in motion. They are context, never newly due events. */
+    activeConsequences: NarrativeIntent[];
     supersededIntents: NarrativeIntent[];
     recentEntries: ScriptEntry[];
     memories: NarrativeMemory[];
     sceneContext?: SceneContext;
     facts?: NarrativeFact[];
+    /** Older setting evolution, separated from the live three-day overlay. */
+    overlaySnapshots?: OverlaySnapshot[];
     /** Recent, safety-filtered web observations available as narrative context. */
     webContext?: WebObservation[];
     /** Present only for a group-scene turn; private-message privacy remains unchanged. */
@@ -401,8 +465,23 @@ export interface CompactionDecision {
     facts?: FactDraft[];
     statePatches?: StatePatchDraft[];
 }
+export interface OverlayCompactionRequest {
+    story: InterludeStory;
+    participant?: InterludeParticipant;
+    target: StatePatchTarget;
+    tier: OverlaySnapshot['tier'];
+    from: Date;
+    to: Date;
+    patches: StatePatchProposal[];
+    snapshots?: OverlaySnapshot[];
+}
+export interface OverlayCompactionDecision {
+    summary: string;
+    majorEvents?: string[];
+}
 export interface NarrativeCompactor {
     compact(request: CompactionRequest): Promise<CompactionDecision>;
+    compactOverlay(request: OverlayCompactionRequest): Promise<OverlayCompactionDecision>;
 }
 export interface NarrativeEmbedder {
     embed(input: string): Promise<number[]>;

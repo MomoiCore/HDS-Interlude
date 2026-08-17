@@ -50,7 +50,7 @@ sharedStory:
 | `interlude.timeline [条数]` | 白名单用户 | 查看最近原始剧本条目 |
 | `interlude.memory [条数]` | 白名单用户 | 查看长期事实记忆 |
 | `interlude.context` | 白名单用户 | 查看当前场景、剧情弧线、关系状态和召回事实 |
-| `interlude.compact` | 管理员 | 立即执行一次记忆压缩 |
+| `interlude.compact` | 管理员 | 整理剧本场景、长期事实、状态提案，并同时执行 overlay 维护 |
 | `interlude.script [条数]` | 管理员 | 查看跨参与者的原始剧本条目 |
 | `interlude.script.note <内容>` | 管理员 | 写入带来源标记的人工剧本注记 |
 | `interlude.memory.facts [条数]` | 管理员 | 列出长期事实及其编号 |
@@ -61,6 +61,8 @@ sharedStory:
 | `interlude.memory.patches [条数]` | 管理员 | 查看人物、关系和世界设定的演化提案 |
 | `interlude.memory.reject <编号>` | 管理员 | 拒绝尚未应用的演化提案 |
 | `interlude.overlay.clear <部分>` | 管理员 | 询问 y/n 后，只清理 character、relationship、world 或 all 对应的设定 overlay |
+| `interlude.overlay.status` | 管理员 | 查看当前 overlay、待积累提案和压缩归档数量 |
+| `interlude.overlay.compact` | 管理员 | 只合并和压缩已应用的 overlay，不整理普通剧本记忆 |
 | `interlude.database.clear` | 管理员 | 询问 y/n 后清空 HDSI 自有 SQLite 表；不会删除 Koishi 或其它插件数据 |
 | `interlude.purge.all` | 管理员 | 询问 y/n 后彻底重置所有平台的剧本、记忆与 Canon，只保留一部空白主剧本 |
 | `interlude.purge.platform <平台>` | 管理员 | 询问 y/n 后清空并归档指定平台的所有故事，例如 sandbox 或 onebot |
@@ -173,13 +175,15 @@ interlude.context
 
 ### `interlude.compact`
 
-立即请求一次后台记忆压缩。
+立即执行一次完整的后台记忆整理。
 
 ```text
 interlude.compact
 ```
 
-压缩模型会整理已完成场景、长期事实和状态变化提案。若当前剧本尚未达到整理阈值，指令会返回“当前还没有达到需要整理的剧本量”。压缩失败不会回滚主剧本，也不会阻塞正常聊天。
+压缩模型会整理已完成场景、长期事实和状态变化提案，并顺便执行 overlay 分层维护。该指令可能调用压缩模型，但不会删除原始剧本。压缩失败不会回滚主剧本，也不会阻塞正常聊天。
+
+如果只想处理 overlay，不想整理普通场景和事实，请使用 `interlude.overlay.compact`。
 
 ## 剧本人工管理
 
@@ -253,6 +257,8 @@ interlude.memory.patches 20
 interlude.memory.reject 8
 ```
 
+状态提案的生命周期是：`proposed`（积累证据）→ `applied`（写入当前 overlay）→ `compacted`（已进入历史快照）。执行 overlay 清理后会标记为 `cleared`。普通人格和关系变化默认需要至少 3 个不同剧本回合、跨越至少 2 个日历日，并受同一路径 72 小时冷却限制；重大变化仍需高置信度。
+
 ### `interlude.overlay.clear <部分>`
 
 只清理剧情累计形成的设定 overlay，不删除 Canon、剧本、长期事实、普通记忆或等待中的意图。适合在 Console 中大幅修改某一项初始设定后使用。
@@ -262,7 +268,7 @@ interlude.memory.reject 8
 - `world`：清理世界状态的演化 overlay。
 - `all`：清理以上全部 overlay，但仍保留剧本和记忆。
 
-执行后插件会询问“确认执行吗？(y/n)”，请回复 `y` 才会继续；回复 `n` 或 60 秒内没有回复都会取消。已经应用的对应状态提案会标为 `cleared`，保留审计记录。
+执行后插件会询问“确认执行吗？(y/n)”，请回复 `y` 才会继续；回复 `n` 或 60 秒内没有回复都会取消。对应的已应用 overlay、历史压缩快照和仍在积累的候选提案都会失效并保留审计记录，避免旧候选在之后重新写回 overlay。
 
 ```text
 interlude.overlay.clear character
@@ -270,6 +276,33 @@ interlude.overlay.clear relationship
 interlude.overlay.clear world
 interlude.overlay.clear all
 ```
+
+### `interlude.overlay.status`
+
+查看当前 overlay 维护状态，不修改数据：
+
+- 全局 character、relationship、world overlay 是否存在；
+- 仍在积累证据的候选提案数量；
+- 已应用或已归档的提案数量；
+- 已清理的提案数量；
+- overlay 压缩快照数量；
+- 参与者关系 overlay 数量。
+
+```text
+interlude.overlay.status
+```
+
+普通提案需要跨多个剧本回合和日期后才会应用。看到“待积累提案”不代表设定已经改变。
+
+### `interlude.overlay.compact`
+
+只执行 overlay 合并和压缩，不整理普通剧本、事实或记忆：
+
+```text
+interlude.overlay.compact
+```
+
+该操作会将较早的已应用状态变化合并为 overlay 快照，并重建当前仍需送入主模型的 live overlay。它不会删除原始状态提案，也不会清理待积累候选。
 
 ## 删除剧本和记忆
 
@@ -315,6 +348,12 @@ interlude.purge.platform sandbox
 
 ```text
 interlude.purge.range 2026-08-01T00:00:00+08:00 2026-08-02T00:00:00+08:00
+```
+
+例如，删除 2026 年 8 月 14 日早上 09:00 至 10:00 的数据：
+
+```text
+interlude.purge.range 2026-08-14T09:00:00+08:00 2026-08-14T10:00:00+08:00
 ```
 
 范围删除不会回退故事的真实时间游标，因此后续剧情不会被重新预写；它只清理指定时间段的持久化记录。SQLite 无法物理删除时，会对匹配记录执行逻辑删除和正文清空。
