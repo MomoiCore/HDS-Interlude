@@ -34,6 +34,201 @@ interlude.init 主角名字
 5. 将两个 QQ 加入白名单，确认它们共享主剧本且各自保留关系资料。
 6. 最后启用记忆压缩、Embedding、群聊和 Puppeteer。
 
+## 推荐配置预设
+
+下面是适合第一次测试的推荐值。配置路径使用 Console 中的完整字段名；API Key、QQ 号和 Token 请填写自己的内容，不要照抄示例。
+
+### 1. 模型与提示词
+
+```yaml
+model.mode: openai-compatible
+model.mainModelId: 主叙事模型预设 ID
+model.mainTemperature: 0.7
+model.mainTopP: 0.9
+model.mainMaxTokens: 0
+model.mainTimeout: 0
+model.mainResponseFormat: prompt-only
+model.formatPrompt: ''
+model.fixedPrompt: ''
+model.failover.enabled: true
+model.failover.strategy: priority
+model.failover.maxAttemptsPerProvider: 2
+model.failover.cooldownMinutes: 5
+model.groupGate.enabled: false
+model.embedding.enabled: false
+model.vision.enabled: true
+```
+
+服务商至少需要填写以下完整字段：
+
+```yaml
+model.providers[].id: primary
+model.providers[].label: Primary provider
+model.providers[].enabled: true
+model.providers[].endpoint: https://你的服务商/v1/chat/completions
+model.providers[].apiKey: 你的 API Key
+model.providers[].model: 你的模型名称
+model.providers[].temperature: 0.7
+model.providers[].topP: 0.9
+model.providers[].maxTokens: 4096
+model.providers[].timeout: 60000
+model.providers[].responseFormat: prompt-only
+```
+
+主叙事提示词：
+
+```text
+model.mainPrompt:
+以有丰富生活感和稍微突发奇想offset的行为、动机和人际关系为基础推动时光的流逝，延续以角色为中心的精彩生活剧本。
+```
+
+全局文风提示词：
+
+```text
+model.stylePrompt:
+你正在持续创作一部以主角为中心的现实主义生活剧本。
+
+每次写作时，请先感受主角在这段真实时间里正在经历怎样的生活：她的日程、行动、身体状态、心情、环境、正在处理的事情，以及与周围人物之间自然流动的关系。让剧本从这些真实而具体的生活质感中展开。
+
+用户消息是发生在当前时刻的一项外部事件。把它自然放入主角原本正在继续的现实中，结合她当下的处境、注意力、情绪和人与人之间的关系，呈现这条消息带来的细微影响。主角可以很快注意到，也可以在完成手头的事、与别人相处、整理情绪或改变计划后才处理它。
+
+在合适的情况下，为当前时间段补充一些属于主角自己的生活内容，例如日常事务、工作或学业、兴趣、身体感受、偶遇、配角互动、临时变化、尚未解决的小事、环境细节或内在念头。让这些内容与既有剧情保持因果和连续性，并自然留下后续的空间。
+
+鼓励生活保留适度的不确定性与变化：计划可能调整，邀约可能出现，配角可能带来新的情绪或信息，旧问题也可能以平静的方式重新浮现。事件保持克制、可信，并让主角的选择具有现实动机。
+
+采用贴近主角的第三人称限知视角，像一部持续上演的话剧。叙事细腻、克制、连贯，关注具体行动、人物来往、情绪余波与关系的缓慢变化。
+
+叙事推进至当前时刻结束。可以保留正在进行的事情、未说出口的念头、尚未解决的关系线索和未来意图；请将已经发生的内容写得完整而自然。
+
+主角的线上聊天风格保持真人感：慵懒、简洁、碎片化，一次只说一两个短句，并随着她当时的状态自然变化。
+```
+
+剧本压缩模型：
+
+```yaml
+model.compaction.enabled: true
+model.compaction.providerId: 留空表示自动选择
+model.compaction.model: 低成本模型名称
+model.compaction.temperature: 0.3
+model.compaction.topP: 1
+model.compaction.maxTokens: 2048
+model.compaction.timeout: 60000
+model.compaction.responseFormat: prompt-only
+model.compaction.mainPrompt: 将已完成的剧情场景压缩为简洁的连贯性剧本，同时保留因果关系、人物承诺、有悬念的情节以及角色性格心态的渐进变化。
+model.compaction.fixedPrompt: ''
+model.compaction.stylePrompt: 简洁、陈述事实、按时间顺序描述、事件具体。
+```
+
+### 2. 剧本起点
+
+```yaml
+storyDefaults.characterName: Minase HDSI
+storyDefaults.characterProfile: 18岁的女孩，刚刚高考结束，正准备开始大学生活。平时喜欢熬夜，有点内向，容易胆怯，生活比较丰富，喜欢尝试一些能力范围内没试过的东西，对想干的事情非常有行动力，在线上聊天话很少且发言简洁、有点喜欢吐槽，但对待事情十分认真，心态很平和
+storyDefaults.userProfile: 一位普通网友
+storyDefaults.relationship: 该用户与主角不经常联系
+storyDefaults.world: 现实社会，主角平常生活在中国
+storyDefaults.supportingCast: 主角的父母，对主角比较严格，工作早出晚归；主角的一个亲姐姐，大主角3岁；主角的一位好友，名叫希绘（Nozomi），比较外向，比主角小一点，两人非常要好。
+storyDefaults.location: 填写主角的主要活动地点
+storyDefaults.style: 当代现实主义生活剧。主角拥有丰富、具体且持续变化的个人生活；配角也有各自的节奏、立场与情绪。关系在日常互动和小事件中缓慢发展，生活常常留下未完成但真实感的余波。
+storyDefaults.timezone: Asia/Shanghai
+```
+
+### 3. OneBot/NapCat 与多人共享剧本
+
+```yaml
+onebot.enabled: true
+onebot.ignoreSelfMessages: true
+onebot.botAccounts[].qq: 机器人 QQ 号
+onebot.botAccounts[].enabled: true
+onebot.userAccounts[].qq: 允许互动的用户 QQ 号
+onebot.userAccounts[].label: 用户备注
+onebot.userAccounts[].enabled: true
+onebot.userAccounts[].profile: 该用户在主角眼中的身份和背景
+onebot.userAccounts[].relationship: 该用户与主角的初始关系
+
+sharedStory.enabled: true
+sharedStory.autoEnrollParticipants: true
+sharedStory.allowCrossConversationMessages: true
+sharedStory.shareParticipantDetails: false
+sharedStory.maxCrossConversationActions: 1
+sharedStory.participantContextLimit: 6
+```
+
+空的 `onebot.userAccounts` 会拒绝所有私聊。每个用户都应单独填写 `profile` 和 `relationship`，不要把所有账号都当作同一个人。
+
+### 4. 私聊、自动推进与主动联系
+
+```yaml
+runtime.captureDirectMessages: true
+runtime.autoCreate: true
+runtime.ignoreCommandMessages: true
+runtime.userMessageDebounceSeconds: 2
+runtime.staleNarrativeRequestWindowSeconds: 5
+runtime.cancelDelayedRepliesOnUserMessage: true
+runtime.splitReplyMessages: true
+runtime.messageSeparator: '<sep/>'
+runtime.typingBaseDelaySeconds: 1
+runtime.typingCharactersPerSecond: 8
+runtime.typingMaxDelaySeconds: 12
+runtime.narrativeRetryDelaySeconds: 60
+runtime.narrativeRetryMaxAttempts: 6
+
+runtime.autoAdvanceEnabled: true
+runtime.autoAdvanceIntervalMinutes: 40
+runtime.autoAdvanceJitterMinutes: 5
+runtime.conversationFollowUpMinutes: [10, 20]
+runtime.conversationFollowUpJitterMinutes: 1
+runtime.allowProactiveMessages: false
+runtime.proactiveWillingnessThreshold: 0.65
+```
+
+第一次测试建议关闭 `runtime.allowProactiveMessages`。确认剧本、延迟回复和自动推进稳定后再开启；主动联系由主模型逐次给出意愿值，不使用固定冷却。
+
+睡眠或休息时间可以使用：
+
+```yaml
+runtime.restWindows[].enabled: true
+runtime.restWindows[].label: night sleep
+runtime.restWindows[].start: '23:00'
+runtime.restWindows[].end: '07:00'
+runtime.restWindows[].minIntervalMinutes: 120
+runtime.restWindows[].maxIntervalMinutes: 240
+```
+
+### 5. 记忆与网页功能
+
+```yaml
+memory.enabled: true
+memory.sceneEntryThreshold: 12
+memory.sceneCharacterThreshold: 8000
+memory.recentEntryLimit: 30
+memory.factLimit: 20
+memory.activeConsequencesEnabled: true
+memory.activeConsequencePromptLimit: 6
+memory.overlayCompressionEnabled: true
+memory.overlayRecentDays: 2
+memory.overlayWeeklyWindowDays: 5
+memory.overlayMonthlyAfterDays: 10
+memory.overlayMonthlyWindowDays: 10
+
+browser.enabled: false
+browser.mode: deferred-only
+```
+
+Embedding 可以在基础功能稳定后再开启。网页观察和 Puppeteer 也建议最后启用，以便区分模型、网络和浏览器问题。
+
+### 6. 日志推荐值
+
+```yaml
+logging.level: info
+logging.verbosity: standard
+logging.format: detailed
+logging.logScriptPreview: false
+logging.logMessageContent: false
+```
+
+排查模型或计时器问题时，可以临时将 `logging.level` 改为 `debug`、`logging.verbosity` 改为 `diagnostic`；测试完成后建议恢复，避免日志过长并记录过多隐私内容。
+
 ## 常用配置位置
 
 | 配置组 | 用途 |
