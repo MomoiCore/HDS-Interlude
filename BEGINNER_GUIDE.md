@@ -1,6 +1,6 @@
 # HDS Interlude 新手引导
 
-HDS Interlude 是 Koishi 的持续叙事聊天插件。插件使用共享主剧本保存角色状态、关系分支、已发生事件、待处理计划和长期记忆。用户消息会进入当前剧本回合；主模型在同一次请求中补写已过去的时间，并决定是否发送、延迟发送或暂不发送消息。
+HDS Interlude 是 Koishi 的持续叙事聊天插件。插件使用共享主剧本保存角色状态、关系分支、已发生事件、待处理计划和长期记忆。用户消息会进入当前剧本回合；主模型在同一次请求中补写已过去的时间，并决定是否发送、延迟发送或暂不发送消息。实时写作使用“剧本引子 + 近期逻辑回合卡”，不会把成批旧剧本正文反复交给模型模仿。回合卡保留主角刚完成的行动、生活状态、用户实际消息与已送达回复；参与者自己的消息、资料和关系则通过独立的可追溯事实进入模型，因此剧情里的猜测不会自动被当成用户真的做过的事。
 
 ## 适用场景
 
@@ -20,6 +20,8 @@ HDS Interlude 是 Koishi 的持续叙事聊天插件。插件使用共享主剧�
 ```text
 interlude.init 主角名字
 ```
+
+Console 页面从上到下就是推荐填写顺序：`storyDefaults` → `model` → `onebot` → `sharedStory` → `runtime` → `memory`。首次测试只需前五项；网页观察和详细日志可以之后再开。
 
 6. 发送一条普通消息，确认模型调用、日志和消息投递正常。
 
@@ -57,9 +59,13 @@ model.failover.cooldownMinutes: 5
 model.groupGate.enabled: false
 model.embedding.enabled: false
 model.vision.enabled: true
+runtime.interactionLedgerLimit: 12
+runtime.interactionLedgerCharacterBudget: 2400
 ```
 
-服务商至少需要填写以下完整字段：
+近期逻辑回合卡会让角色知道最近实际说过什么、已经完成什么事情，以及哪些事仍未结束。它不会把长篇旧剧本塞回主模型；默认值通常无需调整。
+
+先在服务商列表填写连接信息，再在模型列表登记实际模型；后续各功能只需从模型预设下拉菜单选择即可：
 
 ```yaml
 model.providers[].id: primary
@@ -67,13 +73,20 @@ model.providers[].label: Primary provider
 model.providers[].enabled: true
 model.providers[].endpoint: https://你的服务商/v1/chat/completions
 model.providers[].apiKey: 你的 API Key
-model.providers[].model: 你的模型名称
-model.providers[].temperature: 0.7
-model.providers[].topP: 0.9
-model.providers[].maxTokens: 4096
-model.providers[].timeout: 60000
-model.providers[].responseFormat: prompt-only
+model.providers[].extraHeaders: ''
+model.providers[].extraBody: ''
+
+model.models[].id: narrative
+model.models[].label: 主叙事模型
+model.models[].enabled: true
+model.models[].providerId: primary
+model.models[].model: 你的模型名称
+model.models[].maxTokens: 4096
+model.models[].timeout: 60000
+model.models[].responseFormat: prompt-only
 ```
+
+保存/重载一次后，在 `model.mainModelId` 选择 `narrative`。若还要配置压缩、群聊判断或 Embedding，也是在 `model.models` 增加对应预设，再到各功能的 `modelId` 下拉菜单选择；服务商地址和 API Key 不需要重复填写。
 
 主叙事提示词：
 
@@ -172,6 +185,8 @@ runtime.typingCharactersPerSecond: 8
 runtime.typingMaxDelaySeconds: 12
 runtime.narrativeRetryDelaySeconds: 60
 runtime.narrativeRetryMaxAttempts: 6
+runtime.contextEntryLimit: 30
+runtime.contextCharacterBudget: 6000
 
 runtime.autoAdvanceEnabled: true
 runtime.autoAdvanceIntervalMinutes: 40
@@ -199,9 +214,10 @@ runtime.restWindows[].maxIntervalMinutes: 240
 
 ```yaml
 memory.enabled: true
+memory.storyHookPatchAfterConversation: true
+memory.storyHookFullRefreshIdleMinutes: 240
 memory.sceneEntryThreshold: 12
 memory.sceneCharacterThreshold: 8000
-memory.recentEntryLimit: 30
 memory.factLimit: 20
 memory.activeConsequencesEnabled: true
 memory.activeConsequencePromptLimit: 6
@@ -214,6 +230,8 @@ memory.overlayMonthlyWindowDays: 10
 browser.enabled: false
 browser.mode: deferred-only
 ```
+
+默认上下文会扫描最多 30 条近期记录，并保留最多 12 张逻辑回合卡、2400 个字符的近期连续性。每张卡包含主角刚完成的行动、生活状态和实际收发消息。对话结束后的最后一次短期补写会对剧本引子做一个小修改；连续空闲满 4 小时后，下一次常规推进才完整重写引子。两种更新都复用已有写作回合，不会新增独立模型调用。
 
 Embedding 可以在基础功能稳定后再开启。网页观察和 Puppeteer 也建议最后启用，以便区分模型、网络和浏览器问题。
 
@@ -233,8 +251,8 @@ logging.logMessageContent: false
 
 | 配置组 | 用途 |
 | --- | --- |
-| `model` | 服务商、模型预设、提示词、压缩模型、Embedding 和群聊筛选模型。 |
 | `storyDefaults` | 新主剧本的 Canon：主角、世界、默认关系和叙事风格。 |
+| `model` | 服务商、模型预设、提示词、压缩模型、Embedding 和群聊筛选模型。 |
 | `onebot` | 机器人 QQ、私聊白名单、群聊白名单和群聊资料。 |
 | `sharedStory` | 多账号关系分支、跨账号消息和管理员权限。 |
 | `runtime` | 消息合并、延迟发送、自动推进、休息时段和失败重试。 |
@@ -245,7 +263,7 @@ logging.logMessageContent: false
 ## 常用管理指令
 
 - `interlude.status`：查看当前主剧本状态。
-- `interlude.context`：查看场景摘要、关系状态和长期事实。
+- `interlude.context`：查看剧本引子、近期逻辑回合卡、可追溯参与者事实、场景摘要、关系状态和长期事实。
 - `interlude.timeline`：查看当前账号相关的近期剧本条目。
 - `interlude.memory.intents`：查看延迟回复、提醒、承诺和剧情余波。
 - `interlude.pause` / `interlude.resume`：暂停或恢复后台处理。

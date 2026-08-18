@@ -6,7 +6,8 @@ import {
   CompactionDecision, emptyStorySetting, emptyStoryState, IntentDraft, InterludeArc, InterludeScene,
   InterludeParticipant, InterludeStory, MemoryDraft, NarrativeDecision, NarrativeFact, NarrativeIntent,
   GroupContext, GroupGateDecision, GroupGateRequest, GroupMessageContext, NarrativeInteraction, NarrativeProvider, NarrativeRequest, NarrativeCompactor,
-  ContinuitySnapshot, NarrativeEmbedder, OutgoingMessageDraft, ParticipantState, ScriptEntry, ScriptEntryDraft, StatePatchDraft, StatePatchProposal, StorySetting, StoryState,
+  NarrativeEmbedder, OutgoingMessageDraft, ParticipantKnownFact, ParticipantState, RecentLogicalTurn, SceneTrace, ScriptEntry, ScriptEntryDraft,
+  StatePatchDraft, StatePatchProposal, StoryHook, StoryHookPatch, StorySetting, StoryState,
   BrowserIntentDraft, NarrativeImage, OverlaySnapshot, WebObservation, emptyParticipantState,
 } from './types'
 
@@ -30,6 +31,8 @@ export interface Config {
   /** Optional OneBot/NapCat account gate. It only affects the onebot platform. */
   onebot?: OneBotNapCatConfig
 }
+
+type HookUpdateMode = NonNullable<NarrativeRequest['hookUpdate']>
 
 /** One row in the Console account tables. QQ ids are strings because QQ ids
  * can exceed JavaScript's safe integer range and Koishi exposes them as text. */
@@ -80,7 +83,6 @@ export interface MemoryConfig {
   sceneHookCharacters: number
   sceneSummaryCharacters: number
   arcSummaryCharacters: number
-  recentEntryLimit: number
   factLimit: number
   factContentCharacters: number
   factImportanceWeight: number
@@ -115,6 +117,12 @@ export interface MemoryConfig {
   overlayMonthlyWindowDays?: number
   overlayWeeklySummaryCharacters?: number
   overlayMonthlySummaryCharacters?: number
+  /** @deprecated Retained only to load old Console configurations. */
+  storyHookRefreshAdvances?: number
+  /** Apply a compact hook patch at the final configured conversation follow-up. */
+  storyHookPatchAfterConversation?: boolean
+  /** Idle time before the next ordinary advance performs a full hook rewrite. */
+  storyHookFullRefreshIdleMinutes?: number
 }
 
 export interface RuntimeConfig {
@@ -128,6 +136,11 @@ export interface RuntimeConfig {
   minimumAdvanceMinutes: number
   maxStoriesPerSweep: number
   contextEntryLimit: number
+  /** Shared character budget for recent Scene Trace cards and follow-up user events. */
+  contextCharacterBudget?: number
+  /** Number and character budget for factual, delivery-grounded logical turns. */
+  interactionLedgerLimit?: number
+  interactionLedgerCharacterBudget?: number
   memoryLimit: number
   maxScriptCharacters: number
   maxMessageCharacters: number
@@ -605,8 +618,9 @@ export class InterludeService extends Service {
   async updateSetting(story: InterludeStory, patch: Partial<StorySetting>) {
     const setting = mergeSetting(story.setting, patch)
     const now = new Date()
-    await this.dbSet('interlude_story', { id: story.id }, { setting, updatedAt: now })
-    return { ...story, setting, updatedAt: now }
+    const state = { ...normalizeStoryState(story.state), storyHookDirty: true }
+    await this.dbSet('interlude_story', { id: story.id }, { setting, state, updatedAt: now })
+    return { ...story, setting, state, updatedAt: now }
   }
 
   async setStatus(story: InterludeStory, status: InterludeStory['status']) {
@@ -622,6 +636,20 @@ export class InterludeService extends Service {
       sort: { occurredAt: 'desc' },
     })
     return rows.reverse()
+  }
+
+  /** Inspect the same factual turn cards used by the live narrator.  This is
+   * intentionally read-only and keeps raw script prose out of the result. */
+  async recentLogicalTurns(storyId: string, participantId = '') {
+    const limit = Math.max(8, Math.min(24, this.config.runtime.interactionLedgerLimit ?? 12))
+    const entries = await this.recentEntries(storyId, Math.min(200, Math.max(80, limit * 6)))
+    const visible = participantId
+      ? entries.filter(entry => !entry.participantId || entry.participantId === participantId)
+      : entries
+    return collectRecentLogicalTurns(
+      visible, participantId, limit,
+      Math.max(1_800, Math.min(4_000, this.config.runtime.interactionLedgerCharacterBudget ?? 2_400)),
+    )
   }
 
   async memories(storyId: string, limit = this.config.runtime.memoryLimit, participantId?: string) {
@@ -665,7 +693,11 @@ export class InterludeService extends Service {
     const now = new Date()
     await this.appendEntry(story.id, {
       kind: 'admin-note', actor: 'system', content: `[管理员注记] ${text}`,
-      occurredAt: now.toISOString(), metadata: { source: 'administrator' },
+      occurredAt: now.toISOString(),
+      metadata: {
+        source: 'administrator',
+        sceneTrace: { situation: '管理员补充了故事事实。', details: [text], unfinished: [] },
+      },
     }, now)
     this.scheduleCompaction(story.id)
     return true
@@ -916,7 +948,17 @@ export class InterludeService extends Service {
     }
 
     const story = await this.getStory(storyId)
-    await this.ensureContinuity(story, new Date())
+    const state = normalizeStoryState(story.state)
+    const now = new Date()
+    const nextState: StoryState = {
+      ...state, storyHook: undefined, storyHookEntryId: undefined,
+      storyHookAdvanceCount: 0, storyHookDirty: false, lastStoryHookUpdateAt: undefined,
+    }
+    await this.dbSet('interlude_story', { id: storyId }, {
+      state: nextState,
+      updatedAt: now,
+    })
+    await this.ensureContinuity({ ...story, state: nextState }, now)
   }
 
   /** Entry point for configured OneBot group chats. Group members do not need
@@ -1092,15 +1134,18 @@ export class InterludeService extends Service {
       const groupContext: GroupContext = {
         groupId: turn.groupId, channelId: turn.channelId, label: turn.rule.label,
         purpose: turn.rule.purpose, characterRole: turn.rule.characterRole,
-        messages: snapshot.contextMessages,
+        // The buffered batch is supplied as currentEvent below. Keep only the
+        // earlier group conversation here so the same messages are not
+        // presented once as history and once as the present event.
+        messages: snapshot.contextMessages.slice(0, Math.max(0, snapshot.contextMessages.length - batch.length)),
         gateKind: gate.kind, gateReason: gate.reason, gateSummary: gate.contextSummary, targetUserId: gate.targetUserId,
       }
       const userMessage = batch.map((message, index) => `[群聊连续消息 ${index + 1}，发送者 ${message.senderId}]\n${message.content}`).join('\n\n')
-      const { decision, succeeded } = await this.tryDecide(snapshot.story, null, 'user-message', snapshot.from, snapshot.now, userMessage, [], [], groupContext)
+      const { decision, hookUpdate, succeeded } = await this.tryDecide(snapshot.story, null, 'user-message', snapshot.from, snapshot.now, userMessage, [], [], groupContext)
       const result = await this.serial(story.id, async () => {
         if (this.databaseResetting || !succeeded) return { content: '', messages: [] as OutgoingMessageDraft[] }
         const current = await this.getStory(story.id)
-        const messages = await this.persistDecision(current, null, decision, snapshot.from, snapshot.now, false, 'user-message', userMessage)
+        const messages = await this.persistDecision(current, null, decision, snapshot.from, snapshot.now, false, 'user-message', userMessage, hookUpdate)
         const content = normalizeGroupReply(decision.groupReply, this.config.runtime.maxMessageCharacters)
         if (content) {
           await this.appendEntry(current.id, {
@@ -1386,7 +1431,7 @@ export class InterludeService extends Service {
         return
       }
       const superseded = batch.flatMap(message => message.supersededIntents)
-      const { decision, succeeded, effectiveNow, immediateObservations } = await this.tryDecide(
+      const { decision, hookUpdate, succeeded, effectiveNow, immediateObservations } = await this.tryDecide(
         snapshot.story, snapshot.participant, 'user-message', snapshot.from, snapshot.now, userMessage, snapshot.due, superseded, undefined, images,
       )
 
@@ -1403,7 +1448,7 @@ export class InterludeService extends Service {
         // request has survived debounce invalidation. This keeps an obsolete
         // result from contaminating the next combined user turn.
         for (const observation of immediateObservations) await this.persistCollectedWebObservation(observation)
-        const messages = await this.persistDecision(current, currentParticipant, decision, snapshot.from, effectiveNow, true, 'user-message', userMessage)
+        const messages = await this.persistDecision(current, currentParticipant, decision, snapshot.from, effectiveNow, true, 'user-message', userMessage, hookUpdate)
         if (succeeded) {
           await this.dbSet('interlude_story', { id: current.id }, { cursorAt: effectiveNow, updatedAt: now })
           if (snapshot.due.length) await this.dbSet('interlude_intent', { id: { $in: snapshot.due.map(intent => intent.id) } }, { status: 'completed', updatedAt: now })
@@ -1534,13 +1579,15 @@ export class InterludeService extends Service {
         await this.dbSet('interlude_intent', { id: intent.id }, { status: 'cancelled', updatedAt: now })
         continue
       }
-      await this.appendEntry(story.id, {
-        kind: 'character-message', actor: 'character', content,
-        occurredAt: now.toISOString(), metadata: { visible: true, splitSegment: true },
-      }, now, participant.id)
-      await this.recordCharacterMessage(participant, now)
       await this.dbSet('interlude_intent', { id: intent.id }, { status: 'completed', updatedAt: now })
-      messages.push({ participantId: participant.id, content })
+      messages.push({
+        participantId: participant.id, content,
+        metadata: {
+          visible: true, splitSegment: true,
+          turnEntryId: Number(intent.payload?.turnEntryId) || undefined,
+          turnPhase: intent.payload?.turnPhase,
+        },
+      })
     }
     if (splitSegments.length) await this.scheduleNextSplitWake(story.id)
     due = due.filter(intent => intent.type !== 'split-message')
@@ -1601,10 +1648,10 @@ export class InterludeService extends Service {
         : 'advance'
       this.reportOperation('standard', 'info', story, phase,
         '即将执行自动写作 类型=%s 时间段=%s→%s', phaseLabel(phase), formatLogTime(from, story.setting.timezone), formatLogTime(now, story.setting.timezone))
-      const { decision, succeeded } = await this.tryDecide(story, followUpParticipant ?? null, phase, from, now, undefined, [])
+      const { decision, hookUpdate, succeeded } = await this.tryDecide(story, followUpParticipant ?? null, phase, from, now, undefined, [])
       if (succeeded) {
         const permitMessages = phase === 'conversation-follow-up' || this.config.runtime.allowProactiveMessages
-        messages.push(...await this.persistDecision(story, followUpParticipant ?? null, decision, from, now, permitMessages, phase))
+        messages.push(...await this.persistDecision(story, followUpParticipant ?? null, decision, from, now, permitMessages, phase, '', hookUpdate))
         await this.dbSet('interlude_story', { id: story.id }, { cursorAt: now, updatedAt: now })
         advanced = true
       }
@@ -1625,9 +1672,9 @@ export class InterludeService extends Service {
       const dueParticipant = dueParticipantId ? await this.getParticipant(dueParticipantId) : undefined
       this.reportOperation('standard', 'info', current, 'intent-due',
         '即将处理到期计划 数量=%d 类型=%s 参与者=%s', dueBatch.length, Array.from(new Set(dueBatch.map(intent => intent.type))).join(','), dueParticipant?.id || '全局')
-      const { decision, succeeded } = await this.tryDecide(current, dueParticipant ?? null, 'intent-due', dueFrom, now, undefined, dueBatch)
+      const { decision, hookUpdate, succeeded } = await this.tryDecide(current, dueParticipant ?? null, 'intent-due', dueFrom, now, undefined, dueBatch)
       const permitMessages = this.config.runtime.allowProactiveMessages || dueBatch.some(intent => intent.payload?.userInitiated === true)
-      messages.push(...await this.persistDecision(current, dueParticipant ?? null, decision, dueFrom, now, permitMessages, 'intent-due'))
+      messages.push(...await this.persistDecision(current, dueParticipant ?? null, decision, dueFrom, now, permitMessages, 'intent-due', '', hookUpdate))
       if (succeeded) {
         await this.dbSet('interlude_story', { id: current.id }, { cursorAt: now, updatedAt: now })
         await this.dbSet('interlude_intent', { id: { $in: dueBatch.map(intent => intent.id) } }, { status: 'completed', updatedAt: now })
@@ -1657,28 +1704,35 @@ export class InterludeService extends Service {
       this.scheduleDueIntentWake(story.id, new Date(now.getTime() + Math.max(Time.second, this.config.runtime.sweepIntervalMinutes * Time.minute)))
     }
     if (advanced && !delayedReplyProcessed) {
-      const hasMoreFollowUps = dueFollowUps.length > 0 && await this.completeConversationFollowUps(story.id, now)
+      const hasMoreFollowUps = dueFollowUps.length > 0 && await this.completeConversationFollowUps(story.id, dueFollowUps, now)
       if (!hasMoreFollowUps) await this.scheduleNextAutomaticAdvance(story.id, now)
     }
     return messages
   }
 
   private async decide(story: InterludeStory, participant: InterludeParticipant | null, phase: NarrativeRequest['phase'], from: Date, now: Date, userMessage: string | undefined, dueIntents: NarrativeIntent[], supersededIntents: NarrativeIntent[] = [], groupContext?: GroupContext, images: NarrativeImage[] = [], extraWebContext: WebObservation[] = []) {
-    // 这里是主模型上下文的唯一入口。recentEntries 保留近距离质感，场景、弧线和
-    // facts 负责把很长的过去压缩成连续性线索。参与者摘要让模型知道角色
-    // 同时还在与谁维系关系，而不是把每个 QQ 当成独立世界。
+    // 这里是主模型上下文的唯一入口。实时写作只读取低频剧本引子、近期
+    // Scene Trace 事实卡和当前事件；历史正文继续留在数据库供审计和后台
+    // 压缩使用，但不再作为下一次生成的句式样本反复回灌。
     // User and due-intent turns may arrive before the next background sweep.
     // Retire expired consequences here too, while keeping this a cheap local
     // database operation rather than a separate model request.
     await this.expireActiveConsequences(story.id, now)
+    const storyState = normalizeStoryState(story.state)
+    const contextEntryLimit = Math.max(1, this.config.runtime.contextEntryLimit)
+    // A logical turn normally has a user row, a script row, and one or more
+    // delivered bubbles. Scan enough transport rows to retain several whole
+    // turns instead of merely the latest few message fragments.
+    const contextScanLimit = Math.min(200, Math.max(80, contextEntryLimit * 6))
+    const contextCharacterBudget = Math.max(1_000, this.config.runtime.contextCharacterBudget ?? 6_000)
     const factQuery = createFactQuery(participant, userMessage, dueIntents, supersededIntents)
     const [recentEntries, memories, scene, arc, facts, allParticipants, webContext, activeConsequences, overlaySnapshots] = await Promise.all([
-      // Use the runtime limits on the live path.  They are the options shown
-      // to testers as “上下文条目/长期事实”，and should be authoritative.
-      this.recentEntries(story.id, this.config.runtime.contextEntryLimit),
+      // Scan more rows than will be sent: most rows are transport/audit data,
+      // while only compact Scene Trace metadata enters the model prompt.
+      this.recentEntries(story.id, contextScanLimit),
       this.memories(story.id, this.config.runtime.memoryLimit, participant?.id),
-      this.activeScene(story.id),
-      this.activeArc(story.id),
+      storyState.storyHook ? Promise.resolve(undefined) : this.activeScene(story.id),
+      storyState.storyHook ? Promise.resolve(undefined) : this.activeArc(story.id),
       this.facts(story.id, this.config.runtime.memoryLimit, factQuery, participant?.id),
       this.participants(story.id),
       this.webObservations(story.id, participant?.id),
@@ -1689,7 +1743,7 @@ export class InterludeService extends Service {
       ),
       this.overlaySnapshotsForPrompt(story.id, participant?.id, phase === 'advance'),
     ])
-    const visibleEntries = this.sharedStoryConfig.shareParticipantDetails
+    const visibleEntries = phase === 'advance' || this.sharedStoryConfig.shareParticipantDetails
       ? recentEntries
       : recentEntries.filter(entry => {
         // Group transcripts are part of the shared life, but do not expose
@@ -1697,20 +1751,39 @@ export class InterludeService extends Service {
         if (!groupContext && (entry.kind === 'group-message' || entry.kind === 'character-group-message')) return false
         return !entry.participantId || entry.participantId === participant?.id
       })
-    // Background advancement is not a chat turn. It receives the ongoing
-    // life script, scene and facts, but not raw private/group transcript rows
-    // that a model could mistake for a message arriving right now.
-    const turnEntries = phase === 'advance'
-      ? visibleEntries.filter(entry => !['user-message', 'character-message', 'group-message', 'character-group-message'].includes(entry.kind))
-      : visibleEntries
-    // The turn's explicit event decides what is happening now. Historical
-    // rows are context only and are never reinterpreted as a fresh message.
-    const promptEntries = turnEntries.filter(entry => !!entry.content.trim())
+    // A complete logical turn carries the scene state, all source messages
+    // from one user batch, and only character bubbles that were actually
+    // delivered. This replaces separate Scene Trace, raw follow-up messages,
+    // and the old per-bubble interaction ledger.
+    const recentLogicalTurns = collectRecentLogicalTurns(
+      visibleEntries, participant?.id ?? '',
+      Math.max(8, Math.min(24, this.config.runtime.interactionLedgerLimit ?? 12)),
+      Math.max(1_800, Math.min(4_000, this.config.runtime.interactionLedgerCharacterBudget ?? 2_400)),
+    )
+    // Participant facts use only durable records, configured relationship
+    // baselines and exact inbound messages. They deliberately form a separate
+    // channel from authored script prose, so an attractive but imagined scene
+    // cannot become the only record of what a user did in a later turn.
+    const participantKnownFacts = collectParticipantKnownFacts(
+      phase, participant, visibleEntries, facts, from, now,
+      Math.min(16, Math.max(6, contextEntryLimit)), Math.floor(contextCharacterBudget / 3),
+    )
+    const bootstrapContext = !storyState.storyHook
+      ? {
+          scene: scene ?? null,
+          arc: arc ?? null,
+          // Old installations have no Scene Trace metadata yet. One bounded
+          // excerpt lets the first idle refresh build a hook; it disappears
+          // from every later request once that hook exists.
+          recentExcerpt: phase === 'advance' && !recentLogicalTurns.length
+            ? latestNarrativeExcerpt(visibleEntries, Math.min(2_500, contextCharacterBudget))
+            : undefined,
+        }
+      : undefined
     const participants = allParticipants
       .filter(item => item.id !== participant?.id && this.canHandleParticipant(item))
       .sort((left, right) => participantRelevance(right) - participantRelevance(left))
       .slice(0, this.sharedStoryConfig.participantContextLimit)
-    const advanceCanContact = phase === 'advance' && this.config.runtime.allowProactiveMessages
     const visibleDueIntents = this.sharedStoryConfig.shareParticipantDetails
       ? dueIntents
       : dueIntents.filter(intent => !intent.participantId || intent.participantId === participant?.id)
@@ -1725,27 +1798,68 @@ export class InterludeService extends Service {
       .filter(observation => observation.status !== 'deleted')
       .sort((left, right) => left.accessedAt.getTime() - right.accessedAt.getTime())
       .slice(-Math.max(1, this.browserConfig.maxObservationsInPrompt))
-    const refreshContinuity = this.shouldRefreshContinuity(story, phase)
-    return this.narrator.decide({
-      phase, refreshContinuity, story, from, now, userMessage, images,
+    const hookUpdate = this.hookUpdateMode(story, phase, now)
+    const rawDecision = await this.narrator.decide({
+      phase, refreshStoryHook: hookUpdate === 'full', hookUpdate, story, from, now, userMessage, images,
       participant: phase === 'advance' ? null : participant,
       // A background turn may see relationship state through these opaque
       // participant summaries and may proactively contact one account only
       // when the owner explicitly enables proactive messages.
-      participants: phase === 'advance' && !advanceCanContact ? [] : participants,
+      participants,
       dueIntents: visibleDueIntents, activeConsequences: visibleConsequences, supersededIntents,
       shareParticipantDetails: this.sharedStoryConfig.shareParticipantDetails,
-      recentEntries: promptEntries, memories, sceneContext: { scene, arc }, facts, groupContext, webContext: mergedWebContext, overlaySnapshots,
+      storyHook: storyState.storyHook,
+      recentLogicalTurns,
+      participantKnownFacts,
+      memories, bootstrapContext, facts, groupContext, webContext: mergedWebContext, overlaySnapshots,
     })
+    // The model may compose prose freely, but only source-linked participant
+    // notes are retained as future factual context. This is intentionally a
+    // narrow data-boundary check, not a prose filter or a second model pass.
+    return {
+      decision: constrainParticipantEvidence(rawDecision, new Set(participantKnownFacts.map(fact => fact.id))),
+      hookUpdate,
+    }
   }
 
-  /** Refresh continuity only on the first automatic pass or every fifteenth
-   * successful narrative write. Ordinary turns reuse the last snapshot. */
-  private shouldRefreshContinuity(story: InterludeStory, phase: NarrativeRequest['phase']) {
+  /**
+   * Hooks now have two intentionally different jobs.  The final 10/20-minute
+   * aftermath pass merges a small delta after a conversation has settled;
+   * a full replacement waits for a genuinely quiet period.  Both modes reuse
+   * the normal narrator turn and therefore never create a second request.
+   */
+  private hookUpdateMode(story: InterludeStory, phase: NarrativeRequest['phase'], now: Date): HookUpdateMode {
     const state = normalizeStoryState(story.state)
-    if (phase === 'advance' && !state.continuitySnapshot) return true
-    const count = Math.max(0, Math.floor(state.narrativeUpdateCount || 0))
-    return (count + 1) % 15 === 0
+    if (!state.storyHook && (phase === 'advance' || phase === 'conversation-follow-up')) return 'full'
+
+    const config = this.memoryConfig
+    const futureFollowUps = (state.automation?.conversationFollowUpAt ?? [])
+      .map(toDate).some(value => !!value && value > now)
+    if (phase === 'conversation-follow-up') {
+      // The final scheduled aftermath pass is the natural end of a dense
+      // conversation. A later user message clears this plan and starts a new
+      // cycle, so an old patch can never apply to the new conversation.
+      return config.storyHookPatchAfterConversation !== false && state.storyHookDirty && !futureFollowUps
+        ? 'patch'
+        : 'none'
+    }
+    if (phase !== 'advance') return 'none'
+
+    const idleMinutes = Math.max(30, Math.min(10_080, config.storyHookFullRefreshIdleMinutes ?? 240))
+    const lastConversation = toDate(state.automation?.lastConversationActivityAt ?? state.automation?.lastUserMessageAt)
+    const lastFullHook = toDate(state.lastStoryHookUpdateAt)
+    const reference = [lastConversation, lastFullHook]
+      .filter((value): value is Date => !!value)
+      .sort((left, right) => right.getTime() - left.getTime())[0]
+    // Old story states lack the new timestamps. Refresh them once on the
+    // next idle pass, then they enter the four-hour cadence normally.
+    if (!reference) return 'full'
+    if (now.getTime() - reference.getTime() >= idleMinutes * Time.minute) return 'full'
+    // Recover a missed final short pass without waiting for the next dense
+    // conversation, but never let that catch-up override a due full refresh.
+    return config.storyHookPatchAfterConversation !== false && state.storyHookDirty && !futureFollowUps
+      ? 'patch'
+      : 'none'
   }
 
   private async tryDecide(story: InterludeStory, participant: InterludeParticipant | null, phase: NarrativeRequest['phase'], from: Date, now: Date, userMessage: string | undefined, dueIntents: NarrativeIntent[], supersededIntents: NarrativeIntent[] = [], groupContext?: GroupContext, images: NarrativeImage[] = []) {
@@ -1756,7 +1870,8 @@ export class InterludeService extends Service {
       '模型调用开始 任务=主叙事 模型=%s 参与者=%s 时间段=%s→%s 到期计划=%d',
       this.mainModelLabel(), participant?.id || '全局', formatLogTime(from, story.setting.timezone), formatLogTime(now, story.setting.timezone), dueIntents.length)
     try {
-      let decision = await this.decide(story, participant, phase, from, effectiveNow, userMessage, dueIntents, supersededIntents, groupContext, images)
+      let narrative = await this.decide(story, participant, phase, from, effectiveNow, userMessage, dueIntents, supersededIntents, groupContext, images)
+      let { decision, hookUpdate } = narrative
       const immediate = phase === 'user-message' && participant && !groupContext && this.browserConfig.enabled && this.browserConfig.mode === 'allow-immediate'
         ? decision.browserIntents?.map(intent => normalizeBrowserIntentDraft(intent, this.browserConfig)).find(intent => intent?.timing === 'immediate')
         : undefined
@@ -1769,10 +1884,13 @@ export class InterludeService extends Service {
         const observation = await this.collectWebObservation(story, immediate, participant.id, null, new Date(), false)
         immediateObservations = [observation]
         effectiveNow = new Date()
-        decision = await this.decide(story, participant, phase, from, effectiveNow, userMessage, dueIntents, supersededIntents, groupContext, images, immediateObservations)
+        narrative = await this.decide(story, participant, phase, from, effectiveNow, userMessage, dueIntents, supersededIntents, groupContext, images, immediateObservations)
+        decision = narrative.decision
+        hookUpdate = narrative.hookUpdate
       }
       const result = {
         decision,
+        hookUpdate,
         succeeded: true,
         effectiveNow,
         immediateObservations,
@@ -1786,26 +1904,42 @@ export class InterludeService extends Service {
       return result
     } catch (error) {
       this.report('warn', story, phase, '模型调用失败 任务=主叙事 耗时=%dms 错误=%s', Date.now() - startedAt, error)
-      return { decision: {}, succeeded: false, effectiveNow, immediateObservations }
+      return { decision: {}, hookUpdate: 'none' as HookUpdateMode, succeeded: false, effectiveNow, immediateObservations }
     }
   }
 
-  private async persistDecision(story: InterludeStory, participant: InterludeParticipant | null, raw: NarrativeDecision, from: Date, now: Date, permitMessages: boolean, phase: NarrativeRequest['phase'], observedContext = '') {
+  private async persistDecision(story: InterludeStory, participant: InterludeParticipant | null, raw: NarrativeDecision, from: Date, now: Date, permitMessages: boolean, phase: NarrativeRequest['phase'], observedContext = '', hookUpdate: HookUpdateMode = 'none') {
     // 先规范化，再写库：不信任模型给出的时间、长度和结构，尤其不能让未来剧情落库。
     const allParticipants = await this.participants(story.id)
     const permittedParticipantIds = new Set(allParticipants.filter(item => this.canHandleParticipant(item)).map(item => item.id))
-    const refreshContinuity = this.shouldRefreshContinuity(story, phase)
+    const refreshStoryHook = hookUpdate === 'full'
     const decision = normalizeDecision(
       raw, from, now, permitMessages, this.config.runtime, this.sharedStoryConfig,
-      participant?.id ?? '', permittedParticipantIds, phase, this.memoryConfig, refreshContinuity,
+      participant?.id ?? '', permittedParticipantIds, phase, this.memoryConfig, refreshStoryHook, hookUpdate === 'patch',
     )
+    let scriptEntry: ScriptEntry | undefined
     if (decision.script) {
-      await this.appendEntry(story.id, {
+      if (!decision.sceneTrace) {
+        this.reportOperation('standard', 'warn', story, phase, '主叙事未返回 Scene Trace，已保存最小事实卡；请检查模型是否遵守当前 JSON 协议')
+      }
+      if (refreshStoryHook && !decision.storyHook) {
+        this.reportOperation('standard', 'warn', story, phase, '主叙事未返回剧本引子，本次保留原引子并在后续常规推进重试')
+      }
+      if (hookUpdate === 'patch' && !decision.storyHookPatch) {
+        this.reportOperation('standard', 'warn', story, phase, '主叙事未返回剧本引子小修改，本次保留待吸收事实，后续空闲推进将再次尝试')
+      }
+      const sceneTrace = decision.sceneTrace ?? fallbackSceneTrace(phase, observedContext)
+      scriptEntry = await this.appendEntry(story.id, {
         kind: 'script',
         actor: 'narrator',
         content: decision.script,
         occurredAt: now.toISOString(),
-        metadata: { phase, interaction: decision.interaction ?? null },
+        metadata: {
+          phase, hookUpdate, interaction: decision.interaction ?? null, sceneTrace, storyHookPatch: decision.storyHookPatch ?? null,
+          // The card collector uses this bounded interval to attach the exact
+          // inbound batch to one authored turn without guessing from prose.
+          continuityTurn: { from: from.toISOString(), phase, participantId: participant?.id ?? '' },
+        },
       }, now, participant?.id ?? '')
     }
     await this.applyIntentUpdates(story.id, decision.intentUpdates, now, participant?.id)
@@ -1839,11 +1973,31 @@ export class InterludeService extends Service {
       const state = normalizeStoryState(story.state)
       const nextCount = Math.max(0, Math.floor(state.narrativeUpdateCount || 0)) + 1
       const nextState: StoryState = { ...state, narrativeUpdateCount: nextCount }
-      if (decision.continuity) {
-        nextState.continuitySnapshot = decision.continuity
-        nextState.lastContinuityUpdateAt = now.toISOString()
+      if (hookUpdate === 'full') {
+        if (decision.storyHook) {
+          nextState.storyHook = decision.storyHook
+          nextState.storyHookEntryId = scriptEntry?.id
+          nextState.storyHookAdvanceCount = 0
+          // A bootstrap refresh can happen at the first 10-minute follow-up.
+          // Keep the cycle dirty while another scheduled aftermath pass still
+          // exists so the final pass can add its intended small patch.
+          nextState.storyHookDirty = phase === 'conversation-follow-up'
+            && (state.automation?.conversationFollowUpAt ?? []).map(toDate).some(value => !!value && value > now)
+          nextState.lastStoryHookUpdateAt = now.toISOString()
+        }
+      } else if (hookUpdate === 'patch' && decision.storyHookPatch && state.storyHook) {
+        nextState.storyHook = mergeStoryHookPatch(state.storyHook, decision.storyHookPatch)
+        nextState.storyHookDirty = false
+        nextState.lastStoryHookPatchAt = now.toISOString()
+      } else if (phase !== 'advance') {
+        nextState.storyHookDirty = true
       }
       await this.dbSet('interlude_story', { id: story.id }, { state: nextState, updatedAt: now })
+      if (hookUpdate === 'patch' && decision.storyHookPatch) {
+        this.reportOperation('standard', 'info', story, phase, '剧本引子已合并对话末尾小修改 字段=%s', Object.keys(decision.storyHookPatch).join(','))
+      } else if (hookUpdate === 'full' && decision.storyHook) {
+        this.reportOperation('standard', 'info', story, phase, '剧本引子已完成空闲期完整更新')
+      }
     }
 
     const messages: OutgoingMessageDraft[] = []
@@ -1900,12 +2054,10 @@ export class InterludeService extends Service {
       const [first, ...later] = this.splitOutgoingMessage(message.content)
       if (!first) continue
       message.content = first
-      await this.appendEntry(story.id, {
-        kind: 'character-message', actor: 'character', content: first,
-        occurredAt: now.toISOString(), metadata: { visible: true, interaction: interaction ?? null },
-      }, now, message.participantId)
-      const target = allParticipants.find(item => item.id === message.participantId)
-      if (target) await this.recordCharacterMessage(target, now)
+      message.metadata = {
+        ...(message.metadata ?? {}), visible: true, interaction: interaction ?? null,
+        turnEntryId: scriptEntry?.id, turnPhase: phase,
+      }
       // The narrator may have spent tens of seconds generating before this
       // decision reaches the transport layer.  Typing begins when the first
       // bubble is actually committed, never from the earlier prompt time.
@@ -1918,7 +2070,10 @@ export class InterludeService extends Service {
           type: 'split-message',
           summary: 'The character is still typing the next message segment.',
           notBefore: sendAt.toISOString(),
-          payload: { content, visibleMessage: true, userInitiated: phase === 'user-message' },
+          payload: {
+            content, visibleMessage: true, userInitiated: phase === 'user-message',
+            turnEntryId: scriptEntry?.id, turnPhase: phase,
+          },
         }, typingStartedAt, message.participantId)
         this.scheduleDueIntentWake(story.id, sendAt)
       }
@@ -1928,11 +2083,11 @@ export class InterludeService extends Service {
 
   private async appendEntry(storyId: string, entry: ScriptEntryDraft, now: Date, participantId = '') {
     const occurredAt = toDate(entry.occurredAt) ?? now
-    await this.dbCreate('interlude_script_entry', {
+    const created = await this.dbCreate('interlude_script_entry', {
       storyId, participantId, kind: clip(entry.kind, 32) || 'life', actor: clip(entry.actor ?? 'character', 32),
       content: clip(entry.content, 12_000), occurredAt,
       metadata: isRecord(entry.metadata) ? entry.metadata : {}, createdAt: now,
-    })
+    }) as ScriptEntry
     // entryCount 只统计当前活动场景自上次压缩后的新增原始记录，用于触发后台压缩。
     // 它是派生统计字段；SQLite/sql.js 偶发 I/O 锁定时不能让已经写入的
     // 剧本条目回滚，也不能让本轮叙事被误判为模型失败。因此这里采用
@@ -1943,6 +2098,7 @@ export class InterludeService extends Service {
     } catch (error) {
       this.serviceLogger.warn('场景条目计数更新失败，已保留剧本条目：%s', error)
     }
+    return created
   }
 
   private async appendMemory(storyId: string, memory: MemoryDraft, now: Date, participantId = '') {
@@ -2357,13 +2513,15 @@ export class InterludeService extends Service {
         if (!content || !participant || participant.status !== 'active') {
           await this.dbSet('interlude_intent', { id: intent.id }, { status: 'cancelled', updatedAt: now })
         } else {
-          await this.appendEntry(storyId, {
-            kind: 'character-message', actor: 'character', content,
-            occurredAt: now.toISOString(), metadata: { visible: true, splitSegment: true },
-          }, now, participant.id)
-          await this.recordCharacterMessage(participant, now)
           await this.dbSet('interlude_intent', { id: intent.id }, { status: 'completed', updatedAt: now })
-          messages.push({ participantId: participant.id, content })
+          messages.push({
+            participantId: participant.id, content,
+            metadata: {
+              visible: true, splitSegment: true,
+              turnEntryId: Number(intent.payload?.turnEntryId) || undefined,
+              turnPhase: intent.payload?.turnPhase,
+            },
+          })
         }
       }
       // When several segments became overdue together, restore a fresh
@@ -2445,6 +2603,7 @@ export class InterludeService extends Service {
         }
         if (session && current?.id === target.id) {
           await session.send(message.content)
+          await this.recordDeliveredOutgoingMessage(story, target, message)
           continue
         }
         const bot = this.findBotForParticipant(target)
@@ -2453,9 +2612,30 @@ export class InterludeService extends Service {
           continue
         }
         await bot.sendMessage(target.channelId, message.content)
+        await this.recordDeliveredOutgoingMessage(story, target, message)
       } catch (error) {
-          this.report('warn', story, 'intent-due', '消息投递失败 参与者=%s 错误=%s', target.id, error)
+        this.report('warn', story, 'intent-due', '消息投递失败 参与者=%s 错误=%s', target.id, error)
       }
+    }
+  }
+
+  /** Write the visible-message fact only after the adapter has accepted the send. */
+  private async recordDeliveredOutgoingMessage(story: InterludeStory, participant: InterludeParticipant, message: OutgoingMessageDraft) {
+    const now = new Date()
+    try {
+      await this.serial(story.id, async () => {
+        const currentParticipant = await this.getParticipant(participant.id)
+        if (!currentParticipant) return
+        await this.appendEntry(story.id, {
+          kind: 'character-message', actor: 'character', content: message.content,
+          occurredAt: now.toISOString(), metadata: { visible: true, delivery: 'delivered', deliveredAt: now.toISOString(), ...(message.metadata ?? {}) },
+        }, now, currentParticipant.id)
+        await this.recordCharacterMessage(currentParticipant, now)
+      })
+    } catch (error) {
+      // The adapter already accepted this message. A transient SQLite issue
+      // must not turn that completed delivery into a transport failure.
+      this.serviceLogger.debug('可见消息投递记录写入跳过：%s', error)
     }
   }
 
@@ -2512,11 +2692,16 @@ export class InterludeService extends Service {
   /** Remove elapsed short passes after their single writing turn. The next
    * remaining pass stays persisted, so reloads never restart the 10/20-minute
    * sequence or accidentally run both passes at once. */
-  private async completeConversationFollowUps(storyId: string, now: Date) {
+  private async completeConversationFollowUps(storyId: string, processed: Date[], now: Date) {
     const story = await this.getStory(storyId)
+    const completed = new Set(processed.map(value => value.toISOString()))
     const remaining = (story.state.automation?.conversationFollowUpAt ?? [])
       .map(toDate)
-      .filter((value): value is Date => !!value && value > now)
+      // Remove only the pass that this narrator request actually processed.
+      // If the request itself took a long time and the later 20-minute pass
+      // became due meanwhile, keep that final pass so it can still apply the
+      // small Hook patch rather than being silently skipped.
+      .filter((value): value is Date => !!value && !completed.has(value.toISOString()))
       .sort((left, right) => left.getTime() - right.getTime())
     const automation = {
       ...(story.state.automation ?? {}),
@@ -2550,6 +2735,7 @@ export class InterludeService extends Service {
       conversationFollowUpParticipantId: undefined,
       quietUntil: undefined,
       lastUserMessageAt: now.toISOString(),
+      lastConversationActivityAt: now.toISOString(),
       // Covers group-gate silence and provider failures: no old short timer
       // may fire while this fresh conversation event is still unresolved.
       nextAdvanceAt: fallbackNext.toISOString(),
@@ -2561,7 +2747,7 @@ export class InterludeService extends Service {
     await this.scheduleConversationFollowUpsAfterTurn(storyId, now, undefined, participantId)
   }
 
-  /** Schedule the 10/20-minute continuity passes from the actual endpoint of
+  /** Schedule the 10/20-minute aftermath passes from the actual endpoint of
    * a conversation. A delayed reply anchors them after its planned send time. */
   private async scheduleConversationFollowUpsAfterTurn(storyId: string, now: Date, rawInteraction?: NarrativeInteraction, participantId = '') {
     const config = this.autoAdvanceConfig
@@ -2583,6 +2769,7 @@ export class InterludeService extends Service {
       // 40-minute cadence resumes after the final short pass, not from every
       // incoming message.
       quietUntil: undefined,
+      lastConversationActivityAt: now.toISOString(),
       conversationFollowUpAt: followUps.map(value => value.toISOString()),
       conversationFollowUpParticipantId: followUps.length ? participantId || undefined : undefined,
       nextAdvanceAt: normalNext.toISOString(),
@@ -2722,8 +2909,15 @@ export class InterludeService extends Service {
 
   private async recordCharacterMessage(participant: InterludeParticipant, now: Date) {
     const current = normalizeParticipantState(participant.state)
+    // The transport callback can be queued behind a brand-new incoming
+    // message. Do not erase that newer unread/pending state merely because an
+    // earlier outgoing message finished its database bookkeeping afterwards.
+    const newerUserMessage = toDate(current.lastUserMessageAt)
+    const preserveNewerUserState = !!newerUserMessage && newerUserMessage > now
     const state: ParticipantState = {
-      ...current, unreadMessageCount: 0, pendingReplyCount: 0,
+      ...current,
+      unreadMessageCount: preserveNewerUserState ? current.unreadMessageCount : 0,
+      pendingReplyCount: preserveNewerUserState ? current.pendingReplyCount : 0,
       lastCharacterMessageAt: now.toISOString(),
     }
     await this.dbSet('interlude_participant', { id: participant.id }, { state, updatedAt: now })
@@ -2822,7 +3016,6 @@ export class InterludeService extends Service {
       sceneHookCharacters: 2_000,
       sceneSummaryCharacters: 8_000,
       arcSummaryCharacters: 12_000,
-      recentEntryLimit: this.config.runtime.contextEntryLimit,
       factLimit: this.config.runtime.memoryLimit,
       factContentCharacters: 4_000,
       factImportanceWeight: 0.5,
@@ -2850,6 +3043,9 @@ export class InterludeService extends Service {
       overlayMonthlyWindowDays: 10,
       overlayWeeklySummaryCharacters: 1_600,
       overlayMonthlySummaryCharacters: 2_400,
+      storyHookRefreshAdvances: 4,
+      storyHookPatchAfterConversation: true,
+      storyHookFullRefreshIdleMinutes: 240,
       ...(this.config.memory ?? {}),
     }
   }
@@ -3194,7 +3390,11 @@ export class InterludeService extends Service {
   private scheduleFactEmbeddingBackfill(storyId: string) {
     const embedding = this.config.model.embedding
     const batchSize = embedding?.backfillBatchSize ?? 5
-    if (!embedding?.enabled || !embedding.model?.trim() || batchSize <= 0) return
+    // `modelId` selects a model preset and is the preferred Console path.  The
+    // previous check looked only at the legacy free-form `model`, so a valid
+    // preset silently disabled historical-fact backfill.
+    const hasEmbeddingModel = !!(embedding?.modelId?.trim() || embedding?.model?.trim())
+    if (!embedding?.enabled || !hasEmbeddingModel || batchSize <= 0) return
     if (this.factBackfills.has(storyId)) return
     this.factBackfills.add(storyId)
     // This maintenance task deliberately stays out of the narrative serial queue:
@@ -3653,7 +3853,272 @@ function isEnabledAccount(accounts: OneBotAccountRule[] | undefined, qq: string)
   return (accounts ?? []).some(account => account.enabled !== false && normalizeAccountId(account.qq) === normalized)
 }
 
-function normalizeDecision(raw: NarrativeDecision, from: Date, now: Date, permitMessages: boolean, runtime: RuntimeConfig, shared: SharedStoryConfig, currentParticipantId: string, permittedParticipantIds: Set<string>, phase: NarrativeRequest['phase'] = 'advance', memory?: MemoryConfig, refreshContinuity = false) {
+/**
+ * Build the small, source-addressable ledger of participant material for one
+ * narrator request.  Routine idle advances intentionally omit old chat text:
+ * they receive durable facts instead.  A live or short follow-up turn can
+ * additionally use the exact inbound messages that actually happened.
+ */
+function collectParticipantKnownFacts(
+  phase: NarrativeRequest['phase'], participant: InterludeParticipant | null, entries: ScriptEntry[],
+  facts: NarrativeFact[], from: Date, now: Date, limit: number, characterBudget: number,
+) {
+  const selected: ParticipantKnownFact[] = []
+  let remaining = Math.max(600, characterBudget)
+  const add = (fact: ParticipantKnownFact) => {
+    if (!fact.fact.trim() || selected.length >= limit || fact.fact.length > remaining) return
+    if (selected.some(item => item.id === fact.id)) return
+    selected.push(fact)
+    remaining -= fact.fact.length
+  }
+  // Current events are already supplied verbatim. The logical-turn cards
+  // carry settled historical messages for a conversation-follow-up, so this
+  // separate participant-fact channel never revives old messages as fresh
+  // events.
+  const includeExactMessages = phase === 'user-message' || phase === 'intent-due'
+  const messageKinds = new Set(['user-message', 'group-message'])
+  const messages = includeExactMessages ? entries.filter(entry => messageKinds.has(entry.kind)
+    && entry.occurredAt >= from && entry.occurredAt <= now
+    && (!participant || !entry.participantId || entry.participantId === participant.id)
+    && !!entry.content.trim()) : []
+  // Add exact messages newest-first, then restore natural chronology in the
+  // card list only through their timestamp. This gives a dense burst its real
+  // material without inviting older model-written dialogue back into context.
+  for (const entry of [...messages].reverse()) {
+    add({
+      id: `entry:${entry.id}`,
+      participantId: entry.participantId || participant?.id || '',
+      source: entry.occurredAt >= from ? 'current-event' : 'message',
+      fact: entry.content,
+      occurredAt: entry.occurredAt,
+    })
+  }
+
+  if (participant) {
+    add({ id: `profile:${participant.id}`, participantId: participant.id, source: 'profile', fact: participant.profile })
+    add({ id: `relationship:${participant.id}`, participantId: participant.id, source: 'relationship', fact: participant.relationship })
+  }
+
+  // Facts are already independently stored, ranked and scoped by the plugin.
+  // They remain useful in unattended life passes without replaying a chat log.
+  for (const fact of facts) {
+    if (participant && fact.participantId && fact.participantId !== participant.id) continue
+    add({
+      id: `fact:${fact.id}`,
+      participantId: fact.participantId || participant?.id || '',
+      source: 'durable-fact',
+      fact: fact.content,
+      occurredAt: fact.updatedAt,
+    })
+  }
+  return selected.sort((left, right) => (left.occurredAt?.getTime() ?? 0) - (right.occurredAt?.getTime() ?? 0))
+}
+
+/** Keep only compact participant notes whose source ids were actually handed
+ * to this exact model request. The script itself is intentionally untouched. */
+function constrainParticipantEvidence(decision: NarrativeDecision, allowedEvidenceIds: Set<string>): NarrativeDecision {
+  const retain = (items: SceneTrace['participantFacts']) => (items ?? []).map(item => ({
+    fact: item.fact,
+    evidenceIds: item.evidenceIds.filter(id => allowedEvidenceIds.has(id)),
+  })).filter(item => item.evidenceIds.length)
+  if (decision.sceneTrace?.participantFacts) {
+    decision.sceneTrace = { ...decision.sceneTrace, participantFacts: retain(decision.sceneTrace.participantFacts) }
+  }
+  if (decision.storyHook?.participantMatters) {
+    decision.storyHook = { ...decision.storyHook, participantMatters: retain(decision.storyHook.participantMatters) }
+  }
+  if (decision.storyHookPatch?.participantMatters) {
+    decision.storyHookPatch = { ...decision.storyHookPatch, participantMatters: retain(decision.storyHookPatch.participantMatters) }
+  }
+  return decision
+}
+
+/**
+ * Build factual continuity cards from completed narrator turns.  A card is a
+ * turn-level record, not a chat bubble: split messages are attached to their
+ * source script only after the adapter confirms delivery.  This keeps the
+ * writer aware of both the protagonist's immediately preceding life and the
+ * real conversation outcome without replaying authored prose.
+ */
+function collectRecentLogicalTurns(entries: ScriptEntry[], participantId: string, limit: number, characterBudget: number) {
+  const ordered = [...entries].sort((left, right) => left.occurredAt.getTime() - right.occurredAt.getTime() || left.id - right.id)
+  const candidates: RecentLogicalTurn[] = []
+  for (let index = 0; index < ordered.length; index++) {
+    const entry = ordered[index]
+    if (entry.kind !== 'script' || !isRecord(entry.metadata)) continue
+    if (participantId && entry.participantId && entry.participantId !== participantId) continue
+    const trace = normalizeSceneTrace(entry.metadata.sceneTrace)
+    if (!trace) continue
+    const phase = isNarrativePhase(entry.metadata.phase) ? entry.metadata.phase : 'advance'
+    const turn = isRecord(entry.metadata.continuityTurn) ? entry.metadata.continuityTurn : {}
+    const from = toDate(turn.from) ?? ordered.slice(0, index).reverse().find(item => item.kind === 'script')?.occurredAt ?? entry.occurredAt
+    const userMessages = ordered
+      .filter(item => (item.kind === 'user-message' || item.kind === 'group-message')
+        && (!participantId || !item.participantId || item.participantId === participantId)
+        && item.occurredAt >= from && item.occurredAt <= entry.occurredAt && !!item.content.trim())
+      .map(item => item.content.trim())
+    const deliveredMessages = ordered
+      .filter(item => item.kind === 'character-message' && item.participantId === (participantId || entry.participantId)
+        && isDeliveredTurnMessage(item, entry.id))
+      .map(item => item.content.trim())
+      .filter(Boolean)
+    // Existing stories do not have turnEntryId metadata yet.  Until new
+    // deliveries accumulate, attach their delivered bubbles to the nearest
+    // preceding legacy script. This is intentionally upgrade-only; new rows
+    // always use the explicit link above and never rely on timing guesses.
+    const nextScriptAt = ordered.slice(index + 1).find(item => item.kind === 'script')?.occurredAt
+    const characterMessages = deliveredMessages.length || isRecord(entry.metadata.continuityTurn)
+      ? deliveredMessages
+      : ordered
+        .filter(item => item.kind === 'character-message' && item.participantId === (participantId || entry.participantId)
+          && item.occurredAt >= entry.occurredAt && (!nextScriptAt || item.occurredAt < nextScriptAt)
+          && isDeliveredCharacterMessage(item))
+        .map(item => item.content.trim())
+        .filter(Boolean)
+    candidates.push({
+      entryId: entry.id,
+      participantId: entry.participantId,
+      phase,
+      occurredAt: entry.occurredAt,
+      situation: trace.situation,
+      // Old entries predate the explicit actions field. Their concise detail
+      // notes remain the best available life-state bridge during upgrade.
+      actions: trace.actions?.length ? trace.actions : trace.details.slice(0, 2),
+      details: trace.details,
+      unfinished: trace.unfinished,
+      userMessages,
+      characterMessages,
+      interactionState: logicalTurnInteractionState(entry, characterMessages.length),
+      participantFacts: trace.participantFacts ?? [],
+    })
+  }
+
+  // Cross-account contacts originate in another relationship's script, which
+  // is intentionally hidden from this participant. The recipient still needs
+  // a truthful record that a message was delivered, so expose a minimal
+  // recipient-side card without leaking the source branch's scene details.
+  if (participantId) {
+    const knownTurnIds = new Set(candidates.map(card => card.entryId))
+    const orphanDeliveries = new Map<number, ScriptEntry[]>()
+    for (const entry of ordered) {
+      const turnEntryId = isRecord(entry.metadata) ? Number(entry.metadata.turnEntryId) : 0
+      if (entry.kind !== 'character-message' || entry.participantId !== participantId || !turnEntryId || knownTurnIds.has(turnEntryId) || !isDeliveredCharacterMessage(entry)) continue
+      const group = orphanDeliveries.get(turnEntryId) ?? []
+      group.push(entry)
+      orphanDeliveries.set(turnEntryId, group)
+    }
+    for (const [entryId, messages] of orphanDeliveries) {
+      const latest = messages.at(-1)!
+      const first = messages[0]
+      const phase = isRecord(first.metadata) && isNarrativePhase(first.metadata.turnPhase) ? first.metadata.turnPhase : 'intent-due'
+      candidates.push({
+        entryId, participantId, phase, occurredAt: latest.occurredAt,
+        situation: '主角在自己的生活中向当前参与者发出了消息。',
+        actions: ['已向当前参与者发送消息。'], details: [], unfinished: [], userMessages: [],
+        characterMessages: messages.map(message => message.content.trim()).filter(Boolean), interactionState: 'sent', participantFacts: [],
+      })
+    }
+  }
+  candidates.sort((left, right) => left.occurredAt.getTime() - right.occurredAt.getTime() || left.entryId - right.entryId)
+
+  const selected: RecentLogicalTurn[] = []
+  let remaining = Math.max(1_200, characterBudget)
+  for (let index = candidates.length - 1; index >= 0 && selected.length < Math.max(1, limit) && remaining > 0; index--) {
+    const card = fitLogicalTurnCard(candidates[index], remaining)
+    const size = logicalTurnCardSize(card)
+    if (!size) continue
+    selected.unshift(card)
+    remaining -= size
+  }
+  return selected
+}
+
+function isDeliveredTurnMessage(entry: ScriptEntry, turnEntryId: number) {
+  if (!isRecord(entry.metadata) || Number(entry.metadata.turnEntryId) !== turnEntryId) return false
+  return isDeliveredCharacterMessage(entry)
+}
+
+function isDeliveredCharacterMessage(entry: ScriptEntry) {
+  if (!isRecord(entry.metadata)) return false
+  const delivery = entry.metadata.delivery
+  if (delivery === 'pending' || delivery === 'failed' || typeof entry.metadata.deliveryFailedAt === 'string') return false
+  return delivery === 'delivered' || !!toDate(entry.metadata.deliveredAt) || entry.metadata.visible === true
+}
+
+function logicalTurnInteractionState(entry: ScriptEntry, deliveredCount: number): RecentLogicalTurn['interactionState'] {
+  if (deliveredCount) return 'sent'
+  const interaction = isRecord(entry.metadata) && isRecord(entry.metadata.interaction) ? entry.metadata.interaction : undefined
+  if (!interaction) return 'none'
+  if (interaction.seen !== true) return 'unseen'
+  const reply = isRecord(interaction.reply) ? interaction.reply : undefined
+  if (!reply || reply.mode === 'none') return 'seen-no-reply'
+  return reply.mode === 'delayed' ? 'scheduled' : 'none'
+}
+
+/** Keep cards dense enough to preserve many complete turns.  The most useful
+ * facts (current situation, completed actions, delivery state) survive first;
+ * message text is shortened only when a very dense conversation needs it. */
+function fitLogicalTurnCard(card: RecentLogicalTurn, remaining: number): RecentLogicalTurn {
+  const text = (value: string, limit: number) => clip(value.replace(/\s+/g, ' ').trim(), limit)
+  const list = (items: string[], itemLimit: number, count: number) => items.map(item => text(item, itemLimit)).filter(Boolean).slice(-count)
+  const compact: RecentLogicalTurn = {
+    ...card,
+    situation: text(card.situation, 220),
+    actions: list(card.actions, 150, 3),
+    details: list(card.details, 140, 4),
+    unfinished: list(card.unfinished, 160, 3),
+    userMessages: list(card.userMessages, 240, 3),
+    characterMessages: list(card.characterMessages, 220, 4),
+    participantFacts: (card.participantFacts ?? []).map(item => ({
+      fact: text(item.fact, 140), evidenceIds: item.evidenceIds.slice(0, 4),
+    })).filter(item => item.fact).slice(0, 3),
+  }
+  const maximum = Math.max(180, Math.min(620, remaining))
+  while (logicalTurnCardSize(compact) > maximum) {
+    if (compact.details.length) compact.details.shift()
+    else if (compact.participantFacts?.length) compact.participantFacts.shift()
+    else if (compact.unfinished.length > 1) compact.unfinished.shift()
+    else if (compact.characterMessages.length > 1) compact.characterMessages.shift()
+    else if (compact.userMessages.length > 1) compact.userMessages.shift()
+    else if (compact.actions.length > 1) compact.actions.shift()
+    else if (compact.situation.length > 120) compact.situation = text(compact.situation, Math.max(120, compact.situation.length - 60))
+    else break
+  }
+  return compact
+}
+
+function logicalTurnCardSize(card: RecentLogicalTurn) {
+  return card.situation.length
+    + card.actions.reduce((sum, item) => sum + item.length, 0)
+    + card.details.reduce((sum, item) => sum + item.length, 0)
+    + card.unfinished.reduce((sum, item) => sum + item.length, 0)
+    + card.userMessages.reduce((sum, item) => sum + item.length, 0)
+    + card.characterMessages.reduce((sum, item) => sum + item.length, 0)
+    + (card.participantFacts ?? []).reduce((sum, item) => sum + item.fact.length, 0)
+}
+
+function latestNarrativeExcerpt(entries: ScriptEntry[], characterBudget: number) {
+  const entry = [...entries].reverse().find(item => item.kind === 'script' && item.content.trim())
+  if (!entry) return undefined
+  return entry.content.length <= characterBudget
+    ? entry.content
+    : `[旧数据迁移摘录]${entry.content.slice(-characterBudget)}`
+}
+
+function fallbackSceneTrace(phase: NarrativeRequest['phase'], observedContext: string): SceneTrace {
+  const observed = clip(observedContext.replace(/\s+/g, ' ').trim(), 800)
+  return {
+    situation: `${phaseLabel(phase)}已推进至本轮结束时间。`,
+    details: observed ? [`本轮收到的外部事件：${observed}`] : [],
+    unfinished: [],
+  }
+}
+
+function isNarrativePhase(value: unknown): value is NarrativeRequest['phase'] {
+  return value === 'advance' || value === 'conversation-follow-up' || value === 'user-message' || value === 'intent-due'
+}
+
+function normalizeDecision(raw: NarrativeDecision, from: Date, now: Date, permitMessages: boolean, runtime: RuntimeConfig, shared: SharedStoryConfig, currentParticipantId: string, permittedParticipantIds: Set<string>, phase: NarrativeRequest['phase'] = 'advance', memory?: MemoryConfig, refreshStoryHook = false, patchStoryHook = false) {
   const script = typeof raw?.script === 'string'
     ? raw.script.trim().slice(0, runtime.maxScriptCharacters)
     : ''
@@ -3693,22 +4158,117 @@ function normalizeDecision(raw: NarrativeDecision, from: Date, now: Date, permit
       .slice(0, Math.max(0, shared.maxCrossConversationActions))
     : []
   const statePatch = isRecord(raw?.statePatch) ? pickParticipantStatePatch(raw.statePatch) : undefined
-  const continuity = refreshContinuity ? normalizeContinuitySnapshot(raw?.continuity) : undefined
-  return { script, interaction, continuity, entries, memories, intents, intentUpdates, browserIntents, messages, statePatch, crossConversationActions }
+  const sceneTrace = normalizeSceneTrace(raw?.sceneTrace)
+  const storyHook = refreshStoryHook ? normalizeStoryHook(raw?.storyHook ?? raw?.continuity) : undefined
+  const storyHookPatch = patchStoryHook ? normalizeStoryHookPatch(raw?.storyHookPatch) : undefined
+  return { script, sceneTrace, storyHook, storyHookPatch, interaction, entries, memories, intents, intentUpdates, browserIntents, messages, statePatch, crossConversationActions }
 }
 
-function normalizeContinuitySnapshot(value: unknown): ContinuitySnapshot | undefined {
+function normalizeSceneTrace(value: unknown): SceneTrace | undefined {
   if (!isRecord(value)) return undefined
   const text = (item: unknown, limit: number) => typeof item === 'string' ? clip(item, limit).trim() : ''
   const list = (item: unknown, limit: number) => Array.isArray(item)
-    ? item.map(value => text(value, limit)).filter(Boolean).slice(0, 5)
+    ? item.map(value => text(value, limit)).filter(Boolean)
     : []
-  const current = text(value.current, 500)
-  const next = list(value.next, 300).slice(0, 3)
-  const recent = list(value.recent, 300)
-  const salient = list(value.salient, 400)
-  if (!current && !next.length && !recent.length && !salient.length) return undefined
-  return { current, next, recent, salient }
+  const situation = text(value.situation, 300)
+  const actions = list(value.actions, 180).slice(0, 4)
+  const details = list(value.details, 220).slice(0, 6)
+  const unfinished = list(value.unfinished, 240).slice(0, 4)
+  const participantFacts = normalizeParticipantTraceFacts(value.participantFacts)
+  if (!situation && !actions.length && !details.length && !unfinished.length && !participantFacts.length) return undefined
+  return { situation, actions, details, unfinished, participantFacts }
+}
+
+function normalizeStoryHook(value: unknown): StoryHook | undefined {
+  if (!isRecord(value)) return undefined
+  const text = (item: unknown, limit: number) => typeof item === 'string' ? clip(item, limit).trim() : ''
+  const list = (item: unknown, limit: number, count = 8) => Array.isArray(item)
+    ? item.map(value => text(value, limit)).filter(Boolean).slice(0, count)
+    : []
+  // Older custom prompts may still return current/next/recent/salient. Map
+  // those facts once so upgrading does not discard continuity.
+  const currentLife = text(value.currentLife ?? value.current, 500)
+  const presentState = list(value.presentState, 200, 5)
+  const ongoingThreads = list(value.ongoingThreads ?? value.next, 260, 6)
+  const castAndRelations = list(value.castAndRelations, 260, 6)
+  const unresolvedMatters = list(value.unresolvedMatters ?? value.salient, 260, 6)
+  const recentFacts = list(value.recentFacts ?? value.recent, 220, 8)
+  const participantMatters = normalizeParticipantTraceFacts(value.participantMatters)
+  if (!currentLife && !presentState.length && !ongoingThreads.length && !castAndRelations.length && !unresolvedMatters.length && !recentFacts.length && !participantMatters.length) return undefined
+  return { currentLife, presentState, ongoingThreads, castAndRelations, unresolvedMatters, recentFacts, participantMatters }
+}
+
+/** Parse a deliberately partial Hook update. Arrays only appear when the
+ * model wants to refresh that category; merging happens locally afterwards. */
+function normalizeStoryHookPatch(value: unknown): StoryHookPatch | undefined {
+  if (!isRecord(value)) return undefined
+  const text = (item: unknown, limit: number) => typeof item === 'string' ? clip(item, limit).trim() : ''
+  const list = (item: unknown, limit: number, count: number) => Array.isArray(item)
+    ? item.map(value => text(value, limit)).filter(Boolean).slice(0, count)
+    : undefined
+  const patch: StoryHookPatch = {}
+  if (typeof value.currentLife === 'string') {
+    const currentLife = text(value.currentLife, 500)
+    if (currentLife) patch.currentLife = currentLife
+  }
+  const presentState = list(value.presentState, 200, 4)
+  const ongoingThreads = list(value.ongoingThreads, 260, 4)
+  const castAndRelations = list(value.castAndRelations, 260, 4)
+  const unresolvedMatters = list(value.unresolvedMatters, 260, 4)
+  const recentFacts = list(value.recentFacts, 220, 5)
+  const participantMatters = Array.isArray(value.participantMatters)
+    ? normalizeParticipantTraceFacts(value.participantMatters).slice(0, 4)
+    : undefined
+  if (presentState?.length) patch.presentState = presentState
+  if (ongoingThreads?.length) patch.ongoingThreads = ongoingThreads
+  if (castAndRelations?.length) patch.castAndRelations = castAndRelations
+  if (unresolvedMatters?.length) patch.unresolvedMatters = unresolvedMatters
+  if (recentFacts?.length) patch.recentFacts = recentFacts
+  if (participantMatters?.length) patch.participantMatters = participantMatters
+  return Object.keys(patch).length ? patch : undefined
+}
+
+/** A small patch replaces only the immediate present, while list-style
+ * continuity is merged newest-first so it cannot erase an older open thread. */
+function mergeStoryHookPatch(base: StoryHook, patch: StoryHookPatch): StoryHook {
+  return {
+    currentLife: patch.currentLife || base.currentLife,
+    presentState: patch.presentState?.length ? patch.presentState : base.presentState,
+    ongoingThreads: mergeHookNotes(base.ongoingThreads, patch.ongoingThreads, 6),
+    castAndRelations: mergeHookNotes(base.castAndRelations, patch.castAndRelations, 6),
+    unresolvedMatters: mergeHookNotes(base.unresolvedMatters, patch.unresolvedMatters, 6),
+    recentFacts: mergeHookNotes(base.recentFacts, patch.recentFacts, 8),
+    participantMatters: mergeParticipantTraceFacts(base.participantMatters, patch.participantMatters, 6),
+  }
+}
+
+function mergeHookNotes(existing: string[], incoming: string[] | undefined, limit: number) {
+  return Array.from(new Set([...(incoming ?? []), ...existing].map(value => value.trim()).filter(Boolean))).slice(0, limit)
+}
+
+function mergeParticipantTraceFacts(existing: StoryHook['participantMatters'], incoming: StoryHookPatch['participantMatters'], limit: number) {
+  const result: NonNullable<StoryHook['participantMatters']> = []
+  const seen = new Set<string>()
+  for (const item of [...(incoming ?? []), ...(existing ?? [])]) {
+    const key = `${item.fact}\u0000${item.evidenceIds.join('\u0000')}`
+    if (seen.has(key)) continue
+    seen.add(key)
+    result.push(item)
+    if (result.length >= limit) break
+  }
+  return result
+}
+
+function normalizeParticipantTraceFacts(value: unknown) {
+  if (!Array.isArray(value)) return []
+  return value.map(item => {
+    if (!isRecord(item)) return undefined
+    const fact = typeof item.fact === 'string' ? clip(item.fact, 260).trim() : ''
+    const evidenceIds = Array.isArray(item.evidenceIds)
+      ? item.evidenceIds.filter((id): id is string => typeof id === 'string' && /^(entry|fact):\d+$|^(profile|relationship):.+$/.test(id.trim())).map(id => id.trim()).slice(0, 4)
+      : []
+    return fact && evidenceIds.length ? { fact, evidenceIds } : undefined
+  }).filter((item): item is NonNullable<typeof item> => !!item).slice(0, 6)
 }
 
 /**
@@ -4008,7 +4568,7 @@ function normalizeStoryState(value: unknown): StoryState {
   const record = isRecord(value) ? value : {}
   const overlay = isRecord(record.settingOverlay) ? record.settingOverlay : {}
   const automation = isRecord(record.automation) ? record.automation : {}
-  const continuity = isRecord(record.continuitySnapshot) ? normalizeContinuitySnapshot(record.continuitySnapshot) : undefined
+  const storyHook = normalizeStoryHook(record.storyHook ?? record.continuitySnapshot)
   return {
     settingOverlay: {
       characterProfile: typeof overlay.characterProfile === 'string' ? overlay.characterProfile : undefined,
@@ -4020,14 +4580,25 @@ function normalizeStoryState(value: unknown): StoryState {
     },
     activeSceneId: typeof record.activeSceneId === 'number' ? record.activeSceneId : undefined,
     activeArcId: typeof record.activeArcId === 'number' ? record.activeArcId : undefined,
-    continuitySnapshot: continuity,
+    storyHook,
+    storyHookEntryId: typeof record.storyHookEntryId === 'number' && Number.isFinite(record.storyHookEntryId)
+      ? Math.max(0, Math.floor(record.storyHookEntryId))
+      : undefined,
+    storyHookAdvanceCount: Math.max(0, Math.floor(typeof record.storyHookAdvanceCount === 'number' ? record.storyHookAdvanceCount : 0)),
+    storyHookDirty: record.storyHookDirty === true,
     narrativeUpdateCount: Math.max(0, Math.floor(typeof record.narrativeUpdateCount === 'number' ? record.narrativeUpdateCount : 0)),
-    lastContinuityUpdateAt: typeof record.lastContinuityUpdateAt === 'string' ? record.lastContinuityUpdateAt : undefined,
+    lastStoryHookUpdateAt: typeof record.lastStoryHookUpdateAt === 'string'
+      ? record.lastStoryHookUpdateAt
+      : typeof record.lastContinuityUpdateAt === 'string' ? record.lastContinuityUpdateAt : undefined,
+    lastStoryHookPatchAt: typeof record.lastStoryHookPatchAt === 'string' ? record.lastStoryHookPatchAt : undefined,
     automation: {
       quietUntil: typeof automation.quietUntil === 'string' ? automation.quietUntil : undefined,
       nextAdvanceAt: typeof automation.nextAdvanceAt === 'string' ? automation.nextAdvanceAt : undefined,
       lastAutoAdvanceAt: typeof automation.lastAutoAdvanceAt === 'string' ? automation.lastAutoAdvanceAt : undefined,
       lastUserMessageAt: typeof automation.lastUserMessageAt === 'string' ? automation.lastUserMessageAt : undefined,
+      lastConversationActivityAt: typeof automation.lastConversationActivityAt === 'string'
+        ? automation.lastConversationActivityAt
+        : typeof automation.lastUserMessageAt === 'string' ? automation.lastUserMessageAt : undefined,
       conversationFollowUpAt: Array.isArray(automation.conversationFollowUpAt)
         ? automation.conversationFollowUpAt.filter(item => typeof item === 'string').slice(0, 8)
         : [],

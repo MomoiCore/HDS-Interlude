@@ -1,16 +1,29 @@
 # HDS Interlude 配置项详细说明
 ## 阅读顺序
 
-第一次配置先看 `BEGINNER_GUIDE.md`。本文件按 Console 页面说明 OneBot、剧本起点、模型、共享剧本、运行、记忆、网页和日志。
+第一次配置先看 `BEGINNER_GUIDE.md`。Console 现按实际配置顺序显示：剧本起点、模型与提示词、QQ 接入与白名单、共享关系网、对话与时间、连续性与记忆、网页观察、日志与隐私。本文件按字段解释这些配置。
 
 
 
 Console 只显示字段的操作摘要；本文件补充字段语义、约束、推荐值和排障信息。配置项名称与 `src/index.ts` Schema 保持一致。
 
+## Console 页面顺序
+
+1. `storyDefaults`：建立角色、世界与默认关系。
+2. `model`：登记服务商和模型预设，再填写主提示词与专项模型。
+3. `onebot`：限制哪个机器人 QQ 发言、哪些 QQ 或群能进入故事。
+4. `sharedStory`：配置多人共用剧情与跨账号联系。
+5. `runtime`：调整消息合并、分段打字、重试与自动推进。
+6. `memory`：调整剧本引子、事实卡、压缩、余波和 Overlay。
+7. `browser`：可选的 Puppeteer 网页观察。
+8. `logging`：排障期间使用，生产环境建议关闭内容预览。
+
+首次运行建议按前五项配置；其余配置有默认值，可在私聊稳定后逐步打开。
+
 ## 1. 推荐的首次测试顺序
 
 1. 在 `model.mode` 选择 `openai-compatible`。
-2. 在 `model.providers` 填一条聊天服务商：`enabled`、`endpoint`、`apiKey`、`model`。
+2. 在 `model.providers` 填一条服务商：`enabled`、`endpoint`、`apiKey`；随后在 `model.models` 登记主叙事模型，并在 `model.mainModelId` 下拉菜单中选择它。
 3. 在 `storyDefaults` 填主角、默认关系、世界观和文风。
 4. 在 `sharedStory` 保持共享主剧本开启；多人测试时为每个账号配置白名单身份。
 5. 如果使用 NapCat / OneBot QQ，在 `onebot.botAccounts` 和 `onebot.userAccounts` 中分别填写机器人与测试员 QQ。
@@ -27,21 +40,15 @@ Console 只显示字段的操作摘要；本文件补充字段语义、约束、
 
 ### 2.2 model.providers
 
-这里填写聊天模型服务商。Console 会把每个服务商显示成可折叠的纵向配置项，避免字段太多时横向表格超出屏幕；第一次测试只需要一项。
+这里集中填写服务商连接信息。Console 会把每个服务商显示成可折叠的纵向配置项；模型名、输出上限和 JSON 模式统一放在下一节的 `model.models`，因此不会在每个任务中重复填写。
 
 | 字段 | 详细说明 |
 | --- | --- |
-| `id` | 服务商代号，例如 `primary`、`backup`。压缩模型和向量模型可以用它复用对应服务商配置。 |
+| `id` | 服务商代号，例如 `primary`、`backup`。模型预设会用它复用对应服务商配置。 |
 | `label` | Console 里显示的备注名称，不影响调用。 |
 | `enabled` | 是否允许使用这一行。关闭后故障切换也不会选它。 |
 | `endpoint` | OpenAI 兼容 Chat Completions 接口地址。按 Console 提示填写根地址或完整路径；不要填控制台网页、`/models` 地址或服务商主页。 |
 | `apiKey` | 服务商密钥。它相当于密码，不要贴到公开日志、截图或群聊里。 |
-| `model` | 聊天模型名称，必须和服务商文档一致。 |
-| `temperature` | 写作随机性。首次测试建议 `0.6` 到 `0.9`，默认 `0.8`。 |
-| `topP` | 另一种随机性参数。不熟悉时保持 `1`。 |
-| `maxTokens` | 单次最多输出多少 token。越大越完整，但更慢、更贵。填 `0` 表示不主动限制。 |
-| `timeout` | 等模型返回的最长时间，单位毫秒。`60000` 等于 60 秒。 |
-| `responseFormat` | `json-object` 会请求 JSON mode；服务商不支持时改成 `prompt-only`。 |
 | `extraHeaders` | 额外 HTTP 请求头，必须是 JSON 对象。大多数服务商不需要。 |
 | `extraBody` | 额外请求体参数，必须是 JSON 对象。只有服务商文档要求时再填。 |
 
@@ -58,9 +65,15 @@ Console 只显示字段的操作摘要；本文件补充字段语义、约束、
 
 ### 2.4 `model.models` 与各调用位置的模型选择
 
-现在推荐把模型统一登记在 `model.models` 中。每一行填写一个模型预设 ID、所属服务商 ID 和服务商实际模型名；服务商本身只负责 endpoint、API Key、请求头等连接信息。
+现在由 `model.models` 统一登记模型。每一行填写模型预设 ID、显示名称、所属服务商 ID、服务商实际模型名、默认最大输出、超时与 JSON 模式；服务商本身只负责 endpoint、API Key、请求头等连接信息。
 
-主叙事使用 `model.mainModelId`，压缩使用 `model.compaction.modelId`，群聊快速判断使用 `model.groupGate.modelId`，Embedding 使用 `model.embedding.modelId`。每个文本生成任务仍可单独设置 temperature、topP、最大输出和超时时间，不会互相覆盖。
+主叙事使用 `model.mainModelId`，压缩使用 `model.compaction.modelId`，群聊快速判断使用 `model.groupGate.modelId`，Embedding 使用 `model.embedding.modelId`。这些字段在 Console 中是由模型列表生成的下拉菜单；新建或删除模型预设后，先保存/重载一次，即可刷新选项。每个文本生成任务仍可单独设置 temperature、topP、最大输出和超时时间，不会互相覆盖。
+
+### 2.4.1 近期逻辑回合卡
+
+`runtime.interactionLedgerLimit` 与 `runtime.interactionLedgerCharacterBudget` 控制主模型看到的近期逻辑回合卡。每张卡合并一次写作回合中的主角当前处境、已经完成的行动、具体细节、未完成事项、该批用户消息，以及机器人适配器确认投递成功的主角消息。`<sep/>` 的多个气泡会归入同一张卡。
+
+默认保留 12 个回合、最多 2400 个字符。它不读取旧剧本文字，也不会把尚未发送的草稿当作已说出口的话。希望保留更多刚发生的小事时，优先提高字符预算到 2800～3200；它只复用已读取的近期条目，不增加模型调用或 Embedding 请求。
 
 旧配置中的 `providers[].model`、`providers[].temperature` 和 `providers[].topP` 仍保留作为兼容回退；新配置建议统一使用模型预设，避免同一个模型在多个位置重复填写。
 
@@ -68,9 +81,8 @@ Console 只显示字段的操作摘要；本文件补充字段语义、约束、
 
 群聊消息不会直接进入主叙事模型。插件先合并短时间内的连续消息，再调用此处配置的快速模型，得到是否需要主模型处理的分数和简短理由；分数达到 `threshold` 后才调用主模型。
 
-- `enabled`：启用群聊快速判断。未启用或未填写 `model` 时，群聊保持静默。
-- `providerId`：复用 `model.providers` 中某个服务商的 endpoint、API Key 和请求头；留空自动选择。
-- `model`：快速模型名称。优先选择低延迟、低成本且能稳定输出 JSON 的模型。
+- `enabled`：启用群聊快速判断。未启用或未选择 `modelId` 时，群聊保持静默。
+- `modelId`：从模型预设下拉菜单选择快速模型。优先选择低延迟、低成本且能稳定输出 JSON 的模型。
 - `temperature`、`maxTokens`、`timeout`：建议分别从 `0.2`、`500`、`10000` 毫秒开始测试。
 - `threshold`：最低通过分数。默认 `0.65`；数值较低会提高回复频率，数值较高会降低回复频率。
 - `prompt`：追加给快速判断器的群聊规则，例如主角更常回应哪些话题。
@@ -112,8 +124,7 @@ Console 只显示字段的操作摘要；本文件补充字段语义、约束、
 | 字段 | 详细说明 |
 | --- | --- |
 | `enabled` | 是否启用压缩模型。建议开启。 |
-| `providerId` | 使用哪条 `providers` 配置。留空时自动使用当前可用服务商。 |
-| `model` | 压缩模型名称。可填更便宜、更快的模型；留空则使用对应服务商的聊天模型。 |
+| `modelId` | 从模型预设下拉菜单选择压缩模型。可选择更便宜、更快的模型。 |
 | `temperature` | 压缩随机性。建议低一些，例如 `0.3`。 |
 | `maxTokens` | 压缩模型单次输出上限。 |
 | `timeout` | 等压缩模型返回的最长时间。压缩失败不会中断聊天。 |
@@ -130,9 +141,8 @@ Console 只显示字段的操作摘要；本文件补充字段语义、约束、
 | 字段 | 详细说明 |
 | --- | --- |
 | `enabled` | 是否启用语义检索。普通聊天稳定后再打开。 |
-| `providerId` | 使用哪条 `providers` 配置中的 API Key 和额外请求头。 |
+| `modelId` | 从模型预设下拉菜单选择 Embedding 模型；它会复用该模型所属服务商的 API Key 和额外请求头。 |
 | `endpoint` | Embeddings 接口地址。标准 `/chat/completions` 地址可自动推导到 `/embeddings`；其他网关建议填完整地址。 |
-| `model` | 向量模型名称；不要填写聊天模型名称。 |
 | `dimensions` | 向量维度。只有服务商要求时才填，通常保持 `0`。 |
 | `timeout` | 向量请求超时时间。失败后会退回普通记忆排序。 |
 | `maxInputCharacters` | 每次拿去做语义理解的文字上限。 |
@@ -192,7 +202,7 @@ Console 只显示字段的操作摘要；本文件补充字段语义、约束、
 | `enabled` | 历史兼容字段。运行时固定启用共享单主剧本，关闭该字段不会恢复旧的每账号多剧本模式。 |
 | `autoEnrollParticipants` | 获授权的新 QQ 第一次私聊时是否自动加入已有主剧本。开启后无需每个账号都手动执行 `interlude.init`。 |
 | `allowCrossConversationMessages` | 模型是否可以因为 A 的消息，顺带联系 B。例如角色正在和 A 处理事情，便对 B 说“我有点事，晚点找你”。关闭后仍共用生活，但不会跨账号主动发言。 |
-| `shareParticipantDetails` | 是否把其他 QQ 的历史剧本提供给模型。**这会把多个账号的信息发给模型服务商，只有在所有参与者同意且服务商可信时才应开启。**默认关闭时，模型只看到其他账号的匿名 id、待回复数和时间统计；即使打开，其他参与者的资料与关系字段仍保持匿名。 |
+| `shareParticipantDetails` | 是否允许实时私聊回合读取其它关系分支的事实上下文。默认关闭时，当前私聊只读取本关系的近期事实卡；全局空闲推进仍会用各分支的事实卡维持同一份生活，但不会回灌原始聊天正文。共享主剧本仍涉及多账号信息，请只使用可信模型服务商。 |
 | `maxCrossConversationActions` | 单次写作最多跨账号做几次可见联系。建议保持 `1`。填 `0` 等同于禁止这类动作。 |
 | `participantContextLimit` | 每次主模型最多看到多少个其他参与者的摘要。人数很多时降低它可以省 token。 |
 | `managerAccounts` | 可以运行 `interlude.setup`、暂停/恢复、手动推进和压缩命令的 QQ。留空时所有获授权账号都能管理；多人测试建议只填写管理员 QQ。 |
@@ -223,7 +233,10 @@ Console 只显示字段的操作摘要；本文件补充字段语义、约束、
 | `sweepIntervalMinutes` | 后台检查延迟回复和自动推进的间隔；检查本身不一定调用模型。 |
 | `minimumAdvanceMinutes` | 旧版兼容项，通常不用改。 |
 | `maxStoriesPerSweep` | 每轮后台最多处理多少个故事。 |
-| `contextEntryLimit` | 每次给主模型的最近原始剧本条数。 |
+| `contextEntryLimit` | 单次主叙事扫描的近期记录上限，默认 `30`。逻辑回合卡会从中选出完整回合；原剧本正文不会进入这部分。 |
+| `contextCharacterBudget` | 近期场景和可追溯事实的合计字符预算，默认 `6000`。需要保留更多小细节时优先适量增加此值。 |
+| `interactionLedgerLimit` | 近期逻辑回合卡数量，默认 `12`。一张卡可覆盖一批连续用户消息及其完整分段回复。 |
+| `interactionLedgerCharacterBudget` | 近期逻辑回合卡字符预算，默认 `2400`。主角近期行动、生活状态和实际收发消息都会占用此预算。 |
 | `memoryLimit` | 每次给主模型的长期事实条数。 |
 | `maxScriptCharacters` | 单次保存的幕后剧本正文上限。 |
 | `maxMessageCharacters` | 角色单次可见消息长度上限。 |
@@ -244,6 +257,18 @@ Console 只显示字段的操作摘要；本文件补充字段语义、约束、
 
 ## 6. memory：记忆系统
 
+### 剧本引子与近期逻辑回合卡
+
+每次主叙事在输出正文的同时生成 `sceneTrace`，以事实短句记录本回合结束时的处境、已完成的主角行动、具体细节和未完成事项。插件会把它与该回合真实收到的用户消息、适配器确认送达的主角消息合并为一张近期逻辑回合卡。卡片保存在对应剧本条目的 metadata 中，不增加模型调用，也不替代原始剧本。
+
+`storyHook` 是角色当前生活的稳定起点。对话回合先积累逻辑回合卡；最后一次约第 10/20 分钟的短期推进会返回 `storyHookPatch`，只合并本轮确实变化的当前状态、生活线和近期事实。常规推进保持独立生活写作；只有连续空闲达到 `storyHookFullRefreshIdleMinutes` 后，下一次常规推进才会完整重写 `storyHook`。默认是 240 分钟（4 小时）。实时主模型因此能记住最近的小事，又不会持续模仿以前的剧本文风。
+
+### 参与者可追溯事实
+
+主模型上下文还包含单独的 `participantKnownFacts`：当前实际入站消息、短期跟进中保留的用户侧消息、白名单行中的 `profile` / `relationship`，以及已存的长期事实。模型可以把其中确实需要延续的内容写入 `sceneTrace.participantFacts` 或 `storyHook.participantMatters`，并附上来源 id。
+
+插件在保存时只保留来源 id 与本轮实际材料匹配的参与者事实。剧本正文仍可描写主角对某人的期待、猜测或情绪，但这类文学内容不会自动变成“用户已经做过某事”的记忆。这一机制不增加模型调用，也不改写剧本文字。
+
 ### 剧情余波（active consequences）
 
 剧情余波用于保存一段谈话或事件已产生、且仍会影响近期决策的短期影响。例如，一句重要的话会在后续几天影响角色判断，或一次约定会暂时改变日程。它与提醒、承诺、延迟回复共用意图系统，但不会单独触发模型请求；仅在下一次用户消息、短期跟进、自动推进或到期计划的正常写作中作为背景提供。
@@ -261,9 +286,10 @@ Console 只显示字段的操作摘要；本文件补充字段语义、约束、
 | --- | --- |
 | `enabled` | 是否启用场景摘要、长期事实和角色变化记忆。建议开启。 |
 | `backgroundIntervalMinutes` | 后台多久检查一次是否需要整理旧剧本。 |
+| `storyHookPatchAfterConversation` | 是否在最后一次短期补写时合并一个小型 `storyHookPatch`。默认开启；它只更新变化的字段，不覆盖完整引子。 |
+| `storyHookFullRefreshIdleMinutes` | 连续空闲多久后，下一次常规自动推进完整重写 `storyHook`。默认 `240` 分钟，即 4 小时。 |
 | `sceneEntryThreshold` | 当前场景累计多少条新记录后触发整理。 |
 | `sceneCharacterThreshold` | 当前场景累计多少字后触发整理。条数和字数满足任一条件即可。 |
-| `recentEntryLimit` | 主模型保留多少条最近完整剧本。 |
 | `factLimit` | 主模型每次最多带入多少条长期事实。 |
 | `statePatchConfidenceThreshold` | 普通人物、关系、世界变化自动生效所需置信度；不足时只保留候选。 |
 | `majorStatePatchConfidenceThreshold` | 重大变化自动生效所需置信度。建议保持较高。 |
@@ -297,7 +323,7 @@ proposed → applied → compacted
              └→ cleared（管理员清理后）
 ```
 
-普通变化需要至少 3 个不同剧本回合、跨越至少 2 个日历日，并受到同一路径冷却限制。近期关系变化由剧本、`relationshipNotes`、剧情余波和低频连续性快照承载；这些内容不会立即改写 canon 或稳定 overlay。
+普通变化需要至少 3 个不同剧本回合、跨越至少 2 个日历日，并受到同一路径冷却限制。近期关系变化由 Scene Trace、剧本引子、`relationshipNotes` 和剧情余波承载；这些内容不会立即改写 canon 或稳定 overlay。
 
 相关指令：
 

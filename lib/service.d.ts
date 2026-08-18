@@ -1,6 +1,6 @@
 import { Context, Service, Session } from 'koishi';
 import { ModelConfig } from './narrator';
-import { InterludeArc, InterludeScene, InterludeParticipant, InterludeStory, NarrativeFact, NarrativeIntent, NarrativeProvider, NarrativeCompactor, NarrativeEmbedder, OutgoingMessageDraft, StatePatchProposal, StorySetting, StoryState, OverlaySnapshot } from './types';
+import { InterludeArc, InterludeScene, InterludeParticipant, InterludeStory, NarrativeFact, NarrativeIntent, NarrativeProvider, NarrativeCompactor, NarrativeEmbedder, OutgoingMessageDraft, RecentLogicalTurn, StatePatchProposal, StoryHook, StorySetting, StoryState, OverlaySnapshot } from './types';
 export interface Config {
     model: ModelConfig;
     runtime: RuntimeConfig;
@@ -59,7 +59,6 @@ export interface MemoryConfig {
     sceneHookCharacters: number;
     sceneSummaryCharacters: number;
     arcSummaryCharacters: number;
-    recentEntryLimit: number;
     factLimit: number;
     factContentCharacters: number;
     factImportanceWeight: number;
@@ -94,6 +93,12 @@ export interface MemoryConfig {
     overlayMonthlyWindowDays?: number;
     overlayWeeklySummaryCharacters?: number;
     overlayMonthlySummaryCharacters?: number;
+    /** @deprecated Retained only to load old Console configurations. */
+    storyHookRefreshAdvances?: number;
+    /** Apply a compact hook patch at the final configured conversation follow-up. */
+    storyHookPatchAfterConversation?: boolean;
+    /** Idle time before the next ordinary advance performs a full hook rewrite. */
+    storyHookFullRefreshIdleMinutes?: number;
 }
 export interface RuntimeConfig {
     captureDirectMessages: boolean;
@@ -106,6 +111,11 @@ export interface RuntimeConfig {
     minimumAdvanceMinutes: number;
     maxStoriesPerSweep: number;
     contextEntryLimit: number;
+    /** Shared character budget for recent Scene Trace cards and follow-up user events. */
+    contextCharacterBudget?: number;
+    /** Number and character budget for factual, delivery-grounded logical turns. */
+    interactionLedgerLimit?: number;
+    interactionLedgerCharacterBudget?: number;
     memoryLimit: number;
     maxScriptCharacters: number;
     maxMessageCharacters: number;
@@ -287,6 +297,19 @@ export declare class InterludeService extends Service {
     ensureParticipant(story: InterludeStory, session: Session, now?: Date, knownExisting?: InterludeParticipant): Promise<any>;
     updateSetting(story: InterludeStory, patch: Partial<StorySetting>): Promise<{
         setting: StorySetting;
+        state: {
+            storyHookDirty: boolean;
+            settingOverlay: import("./types").StorySettingOverlay;
+            activeSceneId?: number;
+            activeArcId?: number;
+            storyHook?: StoryHook;
+            storyHookEntryId?: number;
+            storyHookAdvanceCount: number;
+            narrativeUpdateCount: number;
+            lastStoryHookUpdateAt?: string;
+            lastStoryHookPatchAt?: string;
+            automation: import("./types").StoryAutomationState;
+        };
         updatedAt: Date;
         id: string;
         platform: string;
@@ -294,7 +317,6 @@ export declare class InterludeService extends Service {
         userId: string;
         channelId: string;
         status: import("./types").StoryStatus;
-        state: StoryState;
         cursorAt: Date;
         createdAt: Date;
     }>;
@@ -312,6 +334,9 @@ export declare class InterludeService extends Service {
         createdAt: Date;
     }>;
     recentEntries(storyId: string, limit?: number): Promise<any[]>;
+    /** Inspect the same factual turn cards used by the live narrator.  This is
+     * intentionally read-only and keeps raw script prose out of the result. */
+    recentLogicalTurns(storyId: string, participantId?: string): Promise<RecentLogicalTurn[]>;
     memories(storyId: string, limit?: number, participantId?: string): Promise<any[]>;
     /** Administrative view: includes global and participant-specific durable facts. */
     adminFacts(storyId: string, limit?: number): Promise<import("minato").FlatPick<NarrativeFact, any>[]>;
@@ -401,9 +426,13 @@ export declare class InterludeService extends Service {
     sweep(): Promise<void>;
     private advanceUnlocked;
     private decide;
-    /** Refresh continuity only on the first automatic pass or every fifteenth
-     * successful narrative write. Ordinary turns reuse the last snapshot. */
-    private shouldRefreshContinuity;
+    /**
+     * Hooks now have two intentionally different jobs.  The final 10/20-minute
+     * aftermath pass merges a small delta after a conversation has settled;
+     * a full replacement waits for a genuinely quiet period.  Both modes reuse
+     * the normal narrator turn and therefore never create a second request.
+     */
+    private hookUpdateMode;
     private tryDecide;
     private persistDecision;
     private appendEntry;
@@ -468,6 +497,8 @@ export declare class InterludeService extends Service {
      * sending every reply back to the account that happened to trigger the turn.
      */
     private sendOutgoingMessages;
+    /** Write the visible-message fact only after the adapter has accepted the send. */
+    private recordDeliveredOutgoingMessage;
     private splitOutgoingMessage;
     private typingDelayMilliseconds;
     private findBotForParticipant;
@@ -481,7 +512,7 @@ export declare class InterludeService extends Service {
     private isAutomaticAdvanceDue;
     private pauseAutomaticAdvanceAfterUserMessage;
     private pauseAutomaticAdvanceAfterDelayedReply;
-    /** Schedule the 10/20-minute continuity passes from the actual endpoint of
+    /** Schedule the 10/20-minute aftermath passes from the actual endpoint of
      * a conversation. A delayed reply anchors them after its planned send time. */
     private scheduleConversationFollowUpsAfterTurn;
     private scheduleNextAutomaticAdvance;

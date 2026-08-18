@@ -25,20 +25,115 @@ export interface StoryState {
   settingOverlay: StorySettingOverlay
   activeSceneId?: number
   activeArcId?: number
-  /** Low-frequency continuity note refreshed on the first auto pass and then after every 15 successful narrative updates. */
-  continuitySnapshot?: ContinuitySnapshot
+  /**
+   * 空闲期更新的事实型剧本引子。它描述故事现在从哪里继续，不保存正文
+   * 句式，因此实时写作无需反复学习主模型以前写过的 prose。
+   */
+  storyHook?: StoryHook
+  /** The script row included in the latest hook; newer rows supply Scene Trace deltas. */
+  storyHookEntryId?: number
+  /** @deprecated Retained for old state records; cadence is now time-based. */
+  storyHookAdvanceCount: number
+  /** Live/follow-up writing created facts that a small patch should absorb. */
+  storyHookDirty: boolean
   narrativeUpdateCount: number
-  lastContinuityUpdateAt?: string
+  /** Last complete hook rewrite. Small patches intentionally do not change it. */
+  lastStoryHookUpdateAt?: string
+  /** Last post-conversation hook patch, kept for diagnostics. */
+  lastStoryHookPatchAt?: string
   /** 自动推进时钟；ISO 字符串便于跨进程/数据库 JSON 持久化。 */
   automation: StoryAutomationState
 }
 
-/** Compact replace-in-place reminder of the protagonist's current state and notable threads. */
-export interface ContinuitySnapshot {
-  current: string
-  next: string[]
-  recent: string[]
-  salient: string[]
+/**
+ * Replace-in-place anchor written only during an ordinary idle advance.
+ * Every field uses short factual notes rather than narrative prose.
+ */
+export interface StoryHook {
+  currentLife: string
+  presentState: string[]
+  ongoingThreads: string[]
+  castAndRelations: string[]
+  unresolvedMatters: string[]
+  recentFacts: string[]
+  /**
+   * Compact participant-related facts carried forward only with a concrete
+   * source reference. This keeps an evocative script sentence from quietly
+   * becoming the system's only evidence about what a user did or said.
+   */
+  participantMatters?: ParticipantTraceFact[]
+}
+
+/**
+ * A post-conversation delta. It only contains hook fields whose current
+ * meaning changed; unspecified fields remain untouched until the next full
+ * idle rewrite.
+ */
+export interface StoryHookPatch {
+  currentLife?: string
+  presentState?: string[]
+  ongoingThreads?: string[]
+  castAndRelations?: string[]
+  unresolvedMatters?: string[]
+  recentFacts?: string[]
+  participantMatters?: ParticipantTraceFact[]
+}
+
+/** A reusable participant fact paired with one or more observed source ids. */
+export interface ParticipantTraceFact {
+  fact: string
+  evidenceIds: string[]
+}
+
+/**
+ * Small factual card emitted with one narrative turn. It preserves concrete
+ * recent details while keeping the previous model prose out of later prompts.
+ */
+export interface SceneTrace {
+  situation: string
+  /** Completed protagonist actions, kept separate from descriptive prose. */
+  actions?: string[]
+  details: string[]
+  unfinished: string[]
+  /** User-related continuity notes. Every item must cite an input evidence id. */
+  participantFacts?: ParticipantTraceFact[]
+}
+
+/**
+ * One compact, delivery-grounded continuity card for a completed writing
+ * turn.  It deliberately combines split chat bubbles into the same logical
+ * exchange and stores factual scene state rather than previous script prose.
+ */
+export interface RecentLogicalTurn {
+  entryId: number
+  participantId: string
+  phase: NarrativePhase
+  occurredAt: Date
+  situation: string
+  actions: string[]
+  details: string[]
+  unfinished: string[]
+  /** Exact external wording observed during this logical turn. */
+  userMessages: string[]
+  /** Only bubbles confirmed by the adapter as delivered. */
+  characterMessages: string[]
+  /** Lets an aftermath pass distinguish a settled exchange from an open one. */
+  interactionState: 'sent' | 'seen-no-reply' | 'unseen' | 'scheduled' | 'none'
+  /** User-related continuity notes. Every item cites observed input evidence. */
+  participantFacts?: ParticipantTraceFact[]
+}
+
+/**
+ * Ground-truth material about a participant. The writer may use it to
+ * understand that participant, and cites its id when preserving a new
+ * participant-related note in sceneTrace or storyHook.
+ */
+export interface ParticipantKnownFact {
+  id: string
+  participantId: string
+  source: 'current-event' | 'message' | 'durable-fact' | 'profile' | 'relationship'
+  fact: string
+  occurredAt?: Date
 }
 
 /**
@@ -64,10 +159,12 @@ export interface StoryAutomationState {
   nextAdvanceAt?: string
   lastAutoAdvanceAt?: string
   lastUserMessageAt?: string
-  /** Short continuity passes scheduled from the latest conversation endpoint. */
+  /** Latest message/reply that anchored a conversation aftermath cycle. */
+  lastConversationActivityAt?: string
+  /** Short life-writing passes scheduled from the latest conversation endpoint. */
   conversationFollowUpAt?: string[]
   /** Relationship branch whose recent conversation supplies the 10/20-minute
-   * continuity context. Omitted for ordinary background advancement. */
+   * user-side aftermath context. Omitted for ordinary background advancement. */
   conversationFollowUpParticipantId?: string
 }
 
@@ -283,7 +380,8 @@ export interface IntentUpdateDraft {
   status: 'completed' | 'cancelled'
   resolution?: string
 }
-export interface OutgoingMessageDraft { participantId: string; content: string }
+/** Metadata is written only after the transport layer confirms delivery. */
+export interface OutgoingMessageDraft { participantId: string; content: string; metadata?: Record<string, unknown> }
 
 /** A future browsing action proposed by the narrator. It is not an observed
  * fact until Puppeteer finishes and produces a WebObservation. */
@@ -322,8 +420,14 @@ export interface NarrativeInteraction {
 export interface NarrativeDecision {
   /** The continuous prose written by the main narrative model. */
   script?: string
-  /** Present only when the request explicitly asks for a low-frequency continuity refresh. */
-  continuity?: ContinuitySnapshot
+  /** Factual delta for this turn; stored beside the script, never displayed. */
+  sceneTrace?: SceneTrace
+  /** Present only when an ordinary idle turn explicitly requests a hook refresh. */
+  storyHook?: StoryHook
+  /** Small delta requested at the settled end of a conversation cycle. */
+  storyHookPatch?: StoryHookPatch
+  /** @deprecated Accepted while upgrading responses based on an older custom prompt. */
+  continuity?: unknown
   /** The machine-readable result placed after the prose. */
   interaction?: NarrativeInteraction
   memories?: MemoryDraft[]
@@ -353,10 +457,12 @@ export interface NarrativeImage {
 }
 
 export interface NarrativeRequest {
-  /** 主模型只读取经过预算控制的连续性包，不读取完整历史。 */
+  /** 主模型读取事实型引子和增量卡，不读取最近剧本正文。 */
   phase: NarrativePhase
-  /** Refresh the compact continuity note on this turn. */
-  refreshContinuity?: boolean
+  /** Replace the factual story hook on this ordinary idle turn. */
+  refreshStoryHook?: boolean
+  /** The hook work requested in this existing narrator call. */
+  hookUpdate?: 'none' | 'patch' | 'full'
   story: InterludeStory
   from: Date
   now: Date
@@ -373,9 +479,14 @@ export interface NarrativeRequest {
   /** Consequences already in motion. They are context, never newly due events. */
   activeConsequences: NarrativeIntent[]
   supersededIntents: NarrativeIntent[]
-  recentEntries: ScriptEntry[]
+  storyHook?: StoryHook
+  /** Factual, delivery-grounded recent logical turns; no previous script prose. */
+  recentLogicalTurns: RecentLogicalTurn[]
+  /** Observed participant material, deliberately separate from authored prose. */
+  participantKnownFacts: ParticipantKnownFact[]
   memories: NarrativeMemory[]
-  sceneContext?: SceneContext
+  /** One-time upgrade/bootstrap context, omitted once a story hook exists. */
+  bootstrapContext?: SceneContext & { recentExcerpt?: string }
   facts?: NarrativeFact[]
   /** Older setting evolution, separated from the live three-day overlay. */
   overlaySnapshots?: OverlaySnapshot[]
@@ -440,7 +551,10 @@ export const emptyStorySetting = (): StorySetting => ({
   timezone: 'Asia/Shanghai',
 })
 
-export const emptyStoryState = (): StoryState => ({ settingOverlay: { characterTraits: [] }, automation: {}, narrativeUpdateCount: 0 })
+export const emptyStoryState = (): StoryState => ({
+  settingOverlay: { characterTraits: [] }, automation: {}, narrativeUpdateCount: 0,
+  storyHookAdvanceCount: 0, storyHookDirty: false,
+})
 
 export const emptyParticipantState = (): ParticipantState => ({
   openThreads: [], relationshipNotes: [], unreadMessageCount: 0, pendingReplyCount: 0,

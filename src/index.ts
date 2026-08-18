@@ -25,17 +25,20 @@ const defaultProvider: ProviderConfig = {
 }
 
 const Provider: Schema<ProviderConfig> = Schema.object({
-  id: Schema.string().default('primary').description('服务商唯一标识；在主模型、压缩模型和 Embedding 配置中引用。'),
+  id: Schema.string().default('primary').description('服务商唯一标识；模型预设会用它关联 endpoint、API Key 与额外请求参数。'),
   label: Schema.string().default('Primary provider').description('仅用于 Console 显示的名称。'),
   enabled: Schema.boolean().default(true).description('是否将该服务商纳入可用候选。'),
   endpoint: Schema.string().default('').description('OpenAI 兼容 Chat Completions 完整地址，例如 /v1/chat/completions。'),
   apiKey: Schema.string().role('secret').default('').description('鉴权密钥；仅保存在 Koishi 配置中。'),
-  model: Schema.string().default('').description('聊天模型标识，例如 gpt-4o-mini。'),
-  temperature: Schema.number().min(0).max(2).default(0.8).description('采样温度；值越高输出越随机。'),
-  topP: Schema.number().min(0).max(1).default(1).description('核采样概率；通常与 temperature 二选一调整。'),
-  maxTokens: Schema.natural().min(0).max(100_000).default(4096).description('单次响应的最大生成 token 数。'),
-  timeout: Schema.natural().min(1_000).max(300_000).default(60_000).role('ms').description('单次 HTTP 请求超时，单位毫秒。'),
-  responseFormat: Schema.union(['json-object', 'prompt-only']).default('json-object').description('请求 JSON 模式；服务商不支持时使用 prompt-only。'),
+  // The following provider fields are retained for existing YAML files.  New
+  // configurations keep model details in `model.models`, so they are hidden
+  // from the Console instead of asking users to enter the same values twice.
+  model: Schema.string().default('').hidden(),
+  temperature: Schema.number().min(0).max(2).default(0.8).hidden(),
+  topP: Schema.number().min(0).max(1).default(1).hidden(),
+  maxTokens: Schema.natural().min(0).max(100_000).default(4096).hidden(),
+  timeout: Schema.natural().min(1_000).max(300_000).default(60_000).role('ms').hidden(),
+  responseFormat: Schema.union(['json-object', 'prompt-only']).default('json-object').hidden(),
   extraHeaders: Schema.string().role('textarea').default('').description('额外 HTTP 请求头，必须是 JSON 对象；无特殊需求留空。'),
   extraBody: Schema.string().role('textarea').default('').description('额外请求体字段，必须是 JSON 对象；无特殊需求留空。'),
 })
@@ -43,15 +46,24 @@ const Provider: Schema<ProviderConfig> = Schema.object({
 // Model credentials live once in providers; this catalogue only describes
 // which model names are available behind each provider.
 const ModelProfile: Schema<import('./narrator').ModelProfile> = Schema.object({
-  id: Schema.string().default('').description('模型预设 ID。各功能通过它引用模型，例如 main-writing。'),
-  label: Schema.string().default('').description('模型预设备注，方便在配置中识别。'),
+  id: Schema.string().default('').description('模型预设 ID，例如 main-writing；各功能从下拉菜单选择它。'),
+  label: Schema.string().default('').description('显示名称，例如“主叙事 / Gemini Flash”。'),
   enabled: Schema.boolean().default(true).description('是否允许各功能继续选择这个模型预设。'),
-  providerId: Schema.string().default('').description('对应的服务商 ID，必须与 providers 中的一行一致。'),
+  providerId: Schema.string().default('').description('对应的服务商 ID，必须与“服务商列表”中的一行一致。'),
   model: Schema.string().default('').description('服务商实际要求的模型名称。'),
   maxTokens: Schema.natural().min(0).max(100_000).default(4096).description('该模型的默认最大输出 token 数。'),
   timeout: Schema.natural().min(1_000).max(300_000).default(60_000).role('ms').description('该模型的默认请求超时时间。'),
   responseFormat: Schema.union(['json-object', 'prompt-only']).default('json-object').description('该模型是否支持 JSON mode。'),
 }).collapse(true)
+
+/**
+ * Dynamic schemas are hydrated by Koishi Console from `ctx.schema`.  They turn
+ * the model-profile id into a real select menu without duplicating provider
+ * credentials or raw model names in every task section.
+ */
+const ModelProfileSelect = (description: string) => Schema.dynamic('hds-interlude.model-profile')
+  .default('')
+  .description(description) as Schema<string>
 
 const Failover: Schema<FailoverConfig> = Schema.object({
   enabled: Schema.boolean().default(true).description('主服务商失败时是否尝试其它已启用服务商。'),
@@ -61,12 +73,12 @@ const Failover: Schema<FailoverConfig> = Schema.object({
 })
 
 const Embedding: Schema<EmbeddingConfig> = Schema.object({
-  modelId: Schema.string().default('').description('模型预设 ID；填写后优先使用 model.models 中对应的模型。'),
+  modelId: ModelProfileSelect('选择已登记的 Embedding 模型预设。先在“模型列表”保存预设，随后这里会显示下拉选项。'),
   liveQuery: Schema.boolean().default(false).description('是否在每次实时对话中额外请求 Embedding 做语义检索。关闭可减少一次网络请求、降低回复延迟；后台向量补齐不受影响。'),
   enabled: Schema.boolean().default(false).description('启用长期事实的语义检索。关闭时退化为规则排序。'),
-  providerId: Schema.string().default('').description('生成向量所使用的服务商 id；留空时自动选择。'),
   endpoint: Schema.string().default('').description('Embedding 接口地址；留空时根据聊天接口推导。'),
-  model: Schema.string().default('').description('Embedding 模型标识，例如 text-embedding-3-small。'),
+  providerId: Schema.string().default('').hidden(),
+  model: Schema.string().default('').hidden(),
   dimensions: Schema.natural().min(0).max(32_768).default(0).description('向量维度；0 表示由服务商决定。'),
   timeout: Schema.natural().min(500).max(120_000).default(10_000).role('ms').description('向量请求超时，单位毫秒。'),
   maxInputCharacters: Schema.natural().min(100).max(32_000).default(4_000).description('单条事实送入 Embedding 的最大字符数。'),
@@ -74,11 +86,11 @@ const Embedding: Schema<EmbeddingConfig> = Schema.object({
 })
 
 const GroupGate: Schema<GroupGateConfig> = Schema.object({
-  modelId: Schema.string().default('').description('模型预设 ID；填写后优先使用 model.models 中对应的模型。'),
+  modelId: ModelProfileSelect('选择已登记的快速判断模型预设。'),
   topP: Schema.number().min(0).max(1).default(1).description('快速判断模型的核采样概率。'),
   enabled: Schema.boolean().default(false).description('是否启用群聊快速判断模型。'),
-  providerId: Schema.string().default('').description('快速判断模型使用的服务商 ID；留空自动选择。'),
-  model: Schema.string().default('').description('快速判断模型名称，建议使用便宜且响应快的小模型。'),
+  providerId: Schema.string().default('').hidden(),
+  model: Schema.string().default('').hidden(),
   temperature: Schema.number().min(0).max(2).default(0.2).description('快速判断模型的随机性，建议较低。'),
   maxTokens: Schema.natural().min(100).max(2_000).default(500).description('快速判断模型最多输出的 token 数。'),
   timeout: Schema.natural().min(1_000).max(60_000).default(10_000).role('ms').description('快速判断请求超时时间，单位毫秒。'),
@@ -91,16 +103,16 @@ const Vision: Schema<VisionConfig> = Schema.object({
 }).collapse(true)
 
 const Model: Schema<ModelConfig> = Schema.object({
-  models: Schema.array(ModelProfile).role('table').default([]).description('一次性登记所有可用模型；各调用功能通过模型预设 ID 引用。'),
-  mainModelId: Schema.string().default('').description('主叙事模型预设 ID；留空时兼容使用 providers 的默认模型。'),
+  mode: Schema.union(['fallback', 'openai-compatible']).default('fallback').description('模型调用模式；fallback 仅用于未配置服务商时的本地回退。'),
+  // 服务商字段较多，使用可折叠的纵向表单；横向 table 在 Console 窄屏上会溢出。
+  providers: Schema.array(Provider.collapse(true)).default([defaultProvider]).description('服务商列表：每项只填写连接地址、密钥和额外请求参数。'),
+  models: Schema.array(ModelProfile).default([]).description('模型列表：每项关联一个服务商与实际模型名。保存后，下方各任务可从下拉菜单选择，不再重复填写服务商或模型名。'),
+  mainModelId: ModelProfileSelect('选择主叙事模型。下拉菜单来自上方“模型列表”；旧配置留空时仍使用服务商旧默认模型。'),
   mainTemperature: Schema.number().min(0).max(2).default(0.8).description('主叙事模型的温度覆盖值。'),
   mainTopP: Schema.number().min(0).max(1).default(1).description('主叙事模型的 top-p 覆盖值。'),
   mainMaxTokens: Schema.natural().min(0).max(100_000).default(0).description('主叙事模型最大输出；0 时使用模型预设或服务商默认值。'),
   mainTimeout: Schema.natural().min(0).max(300_000).default(0).role('ms').description('主叙事模型超时时间；0 时使用模型预设或服务商默认值。'),
   mainResponseFormat: Schema.union(['json-object', 'prompt-only']).default('json-object').description('主叙事模型的响应格式。'),
-  mode: Schema.union(['fallback', 'openai-compatible']).default('fallback').description('模型调用模式；fallback 仅用于未配置服务商时的本地回退。'),
-  // 服务商字段较多，使用可折叠的纵向表单；横向 table 在 Console 窄屏上会溢出。
-  providers: Schema.array(Provider.collapse(true)).default([defaultProvider]).description('聊天服务商列表；折叠行可避免窄屏横向溢出。'),
   failover: Failover.default({ enabled: true, strategy: 'priority', maxAttemptsPerProvider: 1, cooldownMinutes: 5 }).description('主模型请求失败时的切换策略。'),
   mainPrompt: Schema.string().role('textarea').default('以有丰富生活感和稍微突发奇想offset的行为、动机和人际关系为基础推动时光的流逝，延续以角色为中心的精彩生活剧本。').description('主叙事行为指令：定义模型如何连续写作、推进生活并处理外部事件。'),
   formatPrompt: Schema.string().role('textarea').default('').description('结构化输出补充说明；只能扩展固定协议，不能覆盖 JSON、时间和安全校验。'),
@@ -124,10 +136,10 @@ const Model: Schema<ModelConfig> = Schema.object({
   groupGate: GroupGate.default({ enabled: false, modelId: '', providerId: '', model: '', temperature: 0.2, topP: 1, maxTokens: 500, timeout: 10_000, threshold: 0.65, prompt: '' }).description('群聊进入主叙事模型前的快速筛选模型。'),
   vision: Vision.default({ enabled: false }).description('OpenAI-compatible 原生图片输入。'),
   compaction: (Schema.object({
-    modelId: Schema.string().default('').description('模型预设 ID；填写后优先使用 model.models 中对应的模型。'),
+    modelId: ModelProfileSelect('选择已登记的压缩模型预设。'),
     enabled: Schema.boolean().default(true).description('启用后台剧本压缩与长期事实提取。'),
-    providerId: Schema.string().default('').description('压缩请求使用的服务商 id；留空时自动选择。'),
-    model: Schema.string().default('').description('压缩模型标识；建议使用低成本模型。'),
+    providerId: Schema.string().default('').hidden(),
+    model: Schema.string().default('').hidden(),
     temperature: Schema.number().min(0).max(2).default(0.3).description('压缩采样温度；建议保持较低以提高稳定性。'),
     maxTokens: Schema.natural().min(0).max(100_000).default(2048).description('压缩响应的最大 token 数。'),
     timeout: Schema.natural().min(1_000).max(300_000).default(60_000).role('ms').description('压缩请求超时，单位毫秒。'),
@@ -166,7 +178,10 @@ const Runtime: Schema<RuntimeConfig> = Schema.object({
   sweepIntervalMinutes: Schema.natural().min(1).max(1_440).default(5).description('后台扫描周期；仅用于发现到期任务，不代表每轮都调用模型。'),
   minimumAdvanceMinutes: Schema.natural().min(1).max(10_080).default(30).description('手动“interlude.advance”的最小有效补写间隔；到期计划和对话后的短期补写不受此限制。'),
   maxStoriesPerSweep: Schema.natural().min(1).max(1_000).default(20).description('单轮后台扫描最多处理的主剧本数量。'),
-  contextEntryLimit: Schema.natural().min(1).max(200).default(30).description('主模型读取的最近剧本条目数；越大越耗 token。'),
+  contextEntryLimit: Schema.natural().min(1).max(200).default(30).description('主模型最多读取的近期事实卡数量。不会把原剧本正文作为实时上下文。'),
+  contextCharacterBudget: Schema.natural().min(1_000).max(50_000).default(6_000).description('近期事实卡与短期对话上下文的合计字符预算。默认 6000 通常足以保留近期小事。'),
+  interactionLedgerLimit: Schema.natural().min(2).max(24).default(12).description('近期逻辑回合卡的最大数量。一张卡合并一批用户消息、主角已送达的分段消息和当时生活状态。'),
+  interactionLedgerCharacterBudget: Schema.natural().min(200).max(4_000).default(2_400).description('近期逻辑回合卡的字符预算。卡片只保留事实和已送达消息，不回传原剧本正文。建议 1800–2400。'),
   memoryLimit: Schema.natural().min(1).max(200).default(20).description('主模型读取的长期事实数量；会经过相关性重排。'),
   maxScriptCharacters: Schema.natural().min(500).max(12_000).default(8_000).description('单次写作允许追加的剧本文本上限。'),
   maxMessageCharacters: Schema.natural().min(1).max(12_000).default(2_000).description('单条可见消息的最大字符数。'),
@@ -207,9 +222,10 @@ const Browser: Schema<BrowserConfig> = Schema.object({
 const Memory: Schema<MemoryConfig> = Schema.object({
   enabled: Schema.boolean().default(true).description('启用场景压缩、长期事实和状态演化。'),
   backgroundIntervalMinutes: Schema.natural().min(1).max(1_440).default(10).description('后台记忆整理检查周期，单位分钟。'),
+  storyHookPatchAfterConversation: Schema.boolean().default(true).description('对话安静并完成最后一次短期补写时，是否合并一份小型剧本引子修改。它只更新本轮确实变化的状态，不会整份重写。'),
+  storyHookFullRefreshIdleMinutes: Schema.natural().min(30).max(10_080).default(240).description('连续空闲多久后，下一次常规自动推进完整重写剧本引子。默认 240 分钟（4 小时）；短期补写不会触发完整重写。'),
   sceneEntryThreshold: Schema.natural().min(1).max(500).default(12).description('未压缩剧本条目达到此数量时触发整理。'),
   sceneCharacterThreshold: Schema.natural().min(500).max(200_000).default(8_000).description('未压缩剧本字符数达到此值时触发整理。'),
-  recentEntryLimit: Schema.natural().min(1).max(200).default(30).description('每次主模型请求附带的最近原始条目数。'),
   factLimit: Schema.natural().min(1).max(200).default(20).description('每次主模型请求附带的长期事实数。'),
   statePatchConfidenceThreshold: Schema.number().min(0).max(1).default(0.82).description('普通设定变更的最低置信度；低于此值只保留为候选。'),
   majorStatePatchConfidenceThreshold: Schema.number().min(0).max(1).default(0.95).description('重大设定变更的最低置信度。'),
@@ -314,19 +330,20 @@ const SharedStory: Schema<SharedStoryConfig> = Schema.object({
 })
 
 export const Config: Schema<InterludeConfig> = Schema.object({
- onebot: OneBot.description('OneBot/NapCat 的机器人账号和用户白名单。'),
- storyDefaults: StoryDefaults.description('新主剧本的 Canon、角色、世界、关系和叙事风格。'),
-  model: Model.description('第三步：集中配置服务商、模型预设、主叙事模型和各专项模型。'),
- sharedStory: SharedStory.description('多人共享主剧本及跨账号行为。'),
-  runtime: Runtime.description('消息合并、延迟发送、失败重试和自动剧本推进。'),
-  memory: Memory.description('剧本压缩、事实召回、剧情余波和设定演化。'),
-  browser: Browser.description('Puppeteer 只读网页浏览、网页观察与安全边界。'),
-  logging: Logging.description('运行日志级别、格式和隐私选项。'),
+  storyDefaults: StoryDefaults.description('1. 剧本起点：新主剧本的 Canon、角色、世界、关系和叙事风格。'),
+  model: Model.description('2. 模型与提示词：集中配置服务商、模型预设、主叙事及专项模型。'),
+  onebot: OneBot.description('3. QQ 接入与白名单：机器人账号、私聊参与者和群聊范围。'),
+  sharedStory: SharedStory.description('4. 共享关系网：多人共用主剧本及跨账号行为。'),
+  runtime: Runtime.description('5. 对话与时间：消息合并、分段发送、失败重试和自动剧本推进。'),
+  memory: Memory.description('6. 连续性与记忆：事实卡、剧本引子、压缩、余波和设定演化。'),
+  browser: Browser.description('7. 网页观察：Puppeteer 只读网页浏览与安全边界。'),
+  logging: Logging.description('8. 日志与隐私：运行信息密度、显示格式和内容预览。'),
 })
 
 export function apply(ctx: Context, config: InterludeConfig) {
   const startupLogger = ctx.logger('hds-interlude')
   startupLogger.info('plugin load started')
+  installModelProfileSelector(ctx, config)
   const service = new InterludeService(ctx, config)
   registerCommands(ctx, service)
 
@@ -429,15 +446,21 @@ function registerCommands(ctx: Context, service: InterludeService) {
       return memories.map(memory => `[${memory.category}/${memory.importance.toFixed(2)}] ${memory.content}`).join('\n')
     })
 
-  ctx.command('interlude.context', '查看场景摘要、剧情弧线、人物变化覆写和长期事实')
+  ctx.command('interlude.context', '查看剧本引子、近期逻辑回合卡、场景摘要、人物变化和长期事实')
     .action(async ({ session }) => {
       const story = await requireStory(service, session)
       if (typeof story === 'string') return story
       const participant = await service.findParticipant(session, story)
-      const [scene, arc, facts] = await Promise.all([
+      const [scene, arc, facts, recentTurns] = await Promise.all([
         service.activeScene(story.id), service.activeArc(story.id), service.facts(story.id, 8, '', participant?.id),
+        service.recentLogicalTurns(story.id, participant?.id),
       ])
+      const visibleTurns = recentTurns.slice(-6)
+      const participantFacts = visibleTurns.flatMap(turn => turn.participantFacts ?? []).slice(-6)
       return [
+        `剧本引子：${story.state.storyHook ? JSON.stringify(story.state.storyHook) : '等待首次常规空闲推进生成'}`,
+        `近期逻辑回合卡：${visibleTurns.length ? JSON.stringify(visibleTurns) : '尚未生成'}`,
+        `可追溯参与者事实：${participantFacts.length ? JSON.stringify(participantFacts) : '近期没有需要延续的参与者事实'}`,
         `场景引子：${scene?.hook || '尚未整理'}`,
         `场景摘要：${scene?.summary || '尚未整理'}`,
         `剧情弧线：${arc?.title || '开场'} — ${arc?.summary || '尚未整理'}`,
@@ -626,6 +649,38 @@ function registerCommands(ctx: Context, service: InterludeService) {
       await service.purgeStoryRange(story.id, from, to)
       return `已删除 ${from.toISOString()} 至 ${to.toISOString()} 范围内的剧本和关联记忆；Canon 与参与者身份未删除。`
     })
+}
+
+/** Keep task-level model selectors in sync with the centrally registered model list. */
+function installModelProfileSelector(ctx: Context, config: InterludeConfig) {
+  const profiles = config.model.models ?? []
+  const referenced = [
+    config.model.mainModelId,
+    config.model.compaction?.modelId,
+    config.model.embedding?.modelId,
+    config.model.groupGate?.modelId,
+  ].map(value => value?.trim()).filter((value): value is string => !!value)
+  const known = new Set<string>()
+  const options: Schema<string>[] = [Schema.const('').description('未选择（仅兼容旧版服务商默认模型）') as Schema<string>]
+
+  for (const profile of profiles) {
+    const id = profile.id?.trim()
+    if (!id || known.has(id)) continue
+    known.add(id)
+    const provider = config.model.providers.find(item => item.id === profile.providerId)
+    const providerLabel = provider?.label?.trim() || profile.providerId || '未指定服务商'
+    const model = profile.model?.trim() || '未填写模型名'
+    options.push(Schema.const(id).description(`${profile.label?.trim() || id} · ${providerLabel} / ${model}`) as Schema<string>)
+  }
+
+  // Keep a pre-existing reference editable even when its profile was deleted.
+  // Runtime keeps the legacy fallback path instead of corrupting old configs.
+  for (const id of referenced) {
+    if (known.has(id)) continue
+    known.add(id)
+    options.push(Schema.const(id).description(`${id} · 未在模型列表中找到（兼容旧配置）`) as Schema<string>)
+  }
+  ctx.schema.set('hds-interlude.model-profile', Schema.union(options).default(''))
 }
 
 async function askConfirmation(session: Session, message: string) {

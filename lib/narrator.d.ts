@@ -146,6 +146,10 @@ export declare class OpenAICompatibleNarrator implements NarrativeProvider {
     compact(request: CompactionRequest): Promise<CompactionDecision>;
     compactOverlay(request: OverlayCompactionRequest): Promise<OverlayCompactionDecision>;
     private selectProviders;
+    /** Select the first enabled centrally registered model belonging to a backup provider. */
+    private routeForProvider;
+    /** Keep the user-selected model's service first, then retain normal failover order. */
+    private orderPreferredProvider;
     private requestProvider;
 }
 export declare function createNarrator(ctx: Context, config: ModelConfig): NarrativeProvider;
