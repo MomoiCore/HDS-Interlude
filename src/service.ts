@@ -6,7 +6,7 @@ import {
   CompactionDecision, emptyStorySetting, emptyStoryState, IntentDraft, InterludeArc, InterludeScene,
   InterludeParticipant, InterludeStory, MemoryDraft, NarrativeDecision, NarrativeFact, NarrativeIntent,
   GroupContext, GroupGateDecision, GroupGateRequest, GroupMessageContext, NarrativeInteraction, NarrativeProvider, NarrativeRequest, NarrativeCompactor,
-  NarrativeEmbedder, OutgoingMessageDraft, ParticipantKnownFact, ParticipantState, RecentLogicalTurn, SceneTrace, ScriptEntry, ScriptEntryDraft,
+  NarrativeEmbedder, OutgoingMessageDraft, ParticipantKnownFact, ParticipantState, RecentLifeFact, RecentLogicalTurn, SceneTrace, ScriptEntry, ScriptEntryDraft,
   StatePatchDraft, StatePatchProposal, StoryHook, StoryHookPatch, StorySetting, StoryState,
   BrowserIntentDraft, NarrativeImage, OverlaySnapshot, WebObservation, emptyParticipantState,
 } from './types'
@@ -141,6 +141,11 @@ export interface RuntimeConfig {
   /** Number and character budget for factual, delivery-grounded logical turns. */
   interactionLedgerLimit?: number
   interactionLedgerCharacterBudget?: number
+  /** Factual life bridge for the previous day; it excludes transcript wording. */
+  recentLifeFactsEnabled?: boolean
+  recentLifeFactHours?: number
+  recentLifeFactLimit?: number
+  recentLifeFactCharacterBudget?: number
   memoryLimit: number
   maxScriptCharacters: number
   maxMessageCharacters: number
@@ -638,6 +643,20 @@ export class InterludeService extends Service {
     return rows.reverse()
   }
 
+  /**
+   * Read only narrator script rows for the recent-life bridge.  This avoids
+   * scanning every split chat bubble just to recover what happened last night.
+   * The result is still transformed into short factual cards before it reaches
+   * the model.
+   */
+  private async recentSceneTraceEntries(storyId: string, limit = 80) {
+    const rows = await this.dbGet('interlude_script_entry', { storyId, kind: 'script' }, {
+      limit: Math.max(12, Math.min(limit, 160)),
+      sort: { occurredAt: 'desc' },
+    }) as ScriptEntry[]
+    return rows.reverse()
+  }
+
   /** Inspect the same factual turn cards used by the live narrator.  This is
    * intentionally read-only and keeps raw script prose out of the result. */
   async recentLogicalTurns(storyId: string, participantId = '') {
@@ -649,6 +668,23 @@ export class InterludeService extends Service {
     return collectRecentLogicalTurns(
       visible, participantId, limit,
       Math.max(1_800, Math.min(4_000, this.config.runtime.interactionLedgerCharacterBudget ?? 2_400)),
+    )
+  }
+
+  /** Read-only inspection of the transcript-free daily life bridge. */
+  async recentLifeFacts(storyId: string, participantId = '') {
+    if (this.config.runtime.recentLifeFactsEnabled === false) return []
+    const entries = await this.recentSceneTraceEntries(storyId, 80)
+    const visible = participantId
+      ? entries.filter(entry => !entry.participantId || entry.participantId === participantId)
+      : entries
+    return collectRecentLifeFacts(
+      visible,
+      new Date(),
+      Math.max(6, Math.min(168, this.config.runtime.recentLifeFactHours ?? 36)),
+      Math.max(4, Math.min(60, this.config.runtime.recentLifeFactLimit ?? 20)),
+      Math.max(600, Math.min(6_000, this.config.runtime.recentLifeFactCharacterBudget ?? 2_400)),
+      new Set(),
     )
   }
 
@@ -1725,8 +1761,12 @@ export class InterludeService extends Service {
     // turns instead of merely the latest few message fragments.
     const contextScanLimit = Math.min(200, Math.max(80, contextEntryLimit * 6))
     const contextCharacterBudget = Math.max(1_000, this.config.runtime.contextCharacterBudget ?? 6_000)
+    const recentLifeFactsEnabled = this.config.runtime.recentLifeFactsEnabled !== false
+    const recentLifeFactHours = Math.max(6, Math.min(168, this.config.runtime.recentLifeFactHours ?? 36))
+    const recentLifeFactLimit = Math.max(4, Math.min(60, this.config.runtime.recentLifeFactLimit ?? 20))
+    const recentLifeFactCharacterBudget = Math.max(600, Math.min(6_000, this.config.runtime.recentLifeFactCharacterBudget ?? 2_400))
     const factQuery = createFactQuery(participant, userMessage, dueIntents, supersededIntents)
-    const [recentEntries, memories, scene, arc, facts, allParticipants, webContext, activeConsequences, overlaySnapshots] = await Promise.all([
+    const [recentEntries, memories, scene, arc, facts, allParticipants, webContext, activeConsequences, overlaySnapshots, recentSceneEntries] = await Promise.all([
       // Scan more rows than will be sent: most rows are transport/audit data,
       // while only compact Scene Trace metadata enters the model prompt.
       this.recentEntries(story.id, contextScanLimit),
@@ -1742,6 +1782,7 @@ export class InterludeService extends Service {
         phase === 'advance' || this.sharedStoryConfig.shareParticipantDetails ? undefined : participant?.id,
       ),
       this.overlaySnapshotsForPrompt(story.id, participant?.id, phase === 'advance'),
+      recentLifeFactsEnabled ? this.recentSceneTraceEntries(story.id, 80) : Promise.resolve([] as ScriptEntry[]),
     ])
     const visibleEntries = phase === 'advance' || this.sharedStoryConfig.shareParticipantDetails
       ? recentEntries
@@ -1760,12 +1801,29 @@ export class InterludeService extends Service {
       Math.max(8, Math.min(24, this.config.runtime.interactionLedgerLimit ?? 12)),
       Math.max(1_800, Math.min(4_000, this.config.runtime.interactionLedgerCharacterBudget ?? 2_400)),
     )
-    // Participant facts use only durable records, configured relationship
-    // baselines and exact inbound messages. They deliberately form a separate
-    // channel from authored script prose, so an attractive but imagined scene
-    // cannot become the only record of what a user did in a later turn.
+    // Logical cards preserve the immediate exchange. The separate life bridge
+    // reaches further back through compact scene facts, so references such as
+    // “last night” retain concrete actions without restoring old prose or
+    // crowding the request with every short message bubble.
+    const visibleSceneEntries = phase === 'advance' || this.sharedStoryConfig.shareParticipantDetails
+      ? recentSceneEntries
+      : recentSceneEntries.filter(entry => !entry.participantId || entry.participantId === participant?.id)
+    const recentLifeFacts = recentLifeFactsEnabled
+      ? collectRecentLifeFacts(
+        visibleSceneEntries,
+        now,
+        recentLifeFactHours,
+        recentLifeFactLimit,
+        recentLifeFactCharacterBudget,
+        new Set(recentLogicalTurns.map(turn => turn.entryId)),
+      )
+      : []
+    // This small evidence ledger contains only observed inbound messages.
+    // Profile/relationship baselines live in currentParticipant and durable
+    // facts live in the unified continuityFacts payload, avoiding three
+    // copies of the same information in one narrator request.
     const participantKnownFacts = collectParticipantKnownFacts(
-      phase, participant, visibleEntries, facts, from, now,
+      phase, participant, visibleEntries, from, now,
       Math.min(16, Math.max(6, contextEntryLimit)), Math.floor(contextCharacterBudget / 3),
     )
     const bootstrapContext = !storyState.storyHook
@@ -1810,6 +1868,7 @@ export class InterludeService extends Service {
       shareParticipantDetails: this.sharedStoryConfig.shareParticipantDetails,
       storyHook: storyState.storyHook,
       recentLogicalTurns,
+      recentLifeFacts,
       participantKnownFacts,
       memories, bootstrapContext, facts, groupContext, webContext: mergedWebContext, overlaySnapshots,
     })
@@ -3854,14 +3913,14 @@ function isEnabledAccount(accounts: OneBotAccountRule[] | undefined, qq: string)
 }
 
 /**
- * Build the small, source-addressable ledger of participant material for one
- * narrator request.  Routine idle advances intentionally omit old chat text:
- * they receive durable facts instead.  A live or short follow-up turn can
- * additionally use the exact inbound messages that actually happened.
+ * Build the small, source-addressable ledger of observed participant events.
+ * Baseline profile/relationship and durable facts travel through their own
+ * non-duplicated prompt layers. A live or short follow-up turn can use the
+ * exact inbound messages that actually happened.
  */
 function collectParticipantKnownFacts(
   phase: NarrativeRequest['phase'], participant: InterludeParticipant | null, entries: ScriptEntry[],
-  facts: NarrativeFact[], from: Date, now: Date, limit: number, characterBudget: number,
+  from: Date, now: Date, limit: number, characterBudget: number,
 ) {
   const selected: ParticipantKnownFact[] = []
   let remaining = Math.max(600, characterBudget)
@@ -3894,23 +3953,6 @@ function collectParticipantKnownFacts(
     })
   }
 
-  if (participant) {
-    add({ id: `profile:${participant.id}`, participantId: participant.id, source: 'profile', fact: participant.profile })
-    add({ id: `relationship:${participant.id}`, participantId: participant.id, source: 'relationship', fact: participant.relationship })
-  }
-
-  // Facts are already independently stored, ranked and scoped by the plugin.
-  // They remain useful in unattended life passes without replaying a chat log.
-  for (const fact of facts) {
-    if (participant && fact.participantId && fact.participantId !== participant.id) continue
-    add({
-      id: `fact:${fact.id}`,
-      participantId: fact.participantId || participant?.id || '',
-      source: 'durable-fact',
-      fact: fact.content,
-      occurredAt: fact.updatedAt,
-    })
-  }
   return selected.sort((left, right) => (left.occurredAt?.getTime() ?? 0) - (right.occurredAt?.getTime() ?? 0))
 }
 
@@ -3975,6 +4017,7 @@ function collectRecentLogicalTurns(entries: ScriptEntry[], participantId: string
           && isDeliveredCharacterMessage(item))
         .map(item => item.content.trim())
         .filter(Boolean)
+    const interactionState = logicalTurnInteractionState(entry, characterMessages.length)
     candidates.push({
       entryId: entry.id,
       participantId: entry.participantId,
@@ -3988,7 +4031,8 @@ function collectRecentLogicalTurns(entries: ScriptEntry[], participantId: string
       unfinished: trace.unfinished,
       userMessages,
       characterMessages,
-      interactionState: logicalTurnInteractionState(entry, characterMessages.length),
+      exchange: deliveryGroundedConversationTrace(trace.exchange, userMessages, characterMessages, interactionState),
+      interactionState,
       participantFacts: trace.participantFacts ?? [],
     })
   }
@@ -4015,7 +4059,9 @@ function collectRecentLogicalTurns(entries: ScriptEntry[], participantId: string
         entryId, participantId, phase, occurredAt: latest.occurredAt,
         situation: '主角在自己的生活中向当前参与者发出了消息。',
         actions: ['已向当前参与者发送消息。'], details: [], unfinished: [], userMessages: [],
-        characterMessages: messages.map(message => message.content.trim()).filter(Boolean), interactionState: 'sent', participantFacts: [],
+        characterMessages: messages.map(message => message.content.trim()).filter(Boolean),
+        exchange: { responseMeaning: '主角已主动联系当前参与者。', status: 'answered' },
+        interactionState: 'sent', participantFacts: [],
       })
     }
   }
@@ -4031,6 +4077,81 @@ function collectRecentLogicalTurns(entries: ScriptEntry[], participantId: string
     remaining -= size
   }
   return selected
+}
+
+/**
+ * Build a second, transcript-free continuity layer for the recent day.  The
+ * newest logical cards already contain the immediate dialogue semantics;
+ * these older scene facts preserve the surrounding life that made those
+ * exchanges meaningful.  No prior prose or old chat bubble wording crosses
+ * this boundary.
+ */
+function collectRecentLifeFacts(
+  entries: ScriptEntry[], now: Date, hours: number, limit: number, characterBudget: number, excludeEntryIds: Set<number>,
+) {
+  const since = now.getTime() - hours * Time.hour
+  const candidates: RecentLifeFact[] = []
+  for (const entry of entries) {
+    if (entry.occurredAt.getTime() < since || excludeEntryIds.has(entry.id) || !isRecord(entry.metadata)) continue
+    const trace = normalizeSceneTrace(entry.metadata.sceneTrace)
+    if (!trace) continue
+    const phase = isNarrativePhase(entry.metadata.phase) ? entry.metadata.phase : 'advance'
+    const userMeaning = trace.exchange?.userMeaning?.trim()
+    candidates.push({
+      entryId: entry.id,
+      occurredAt: entry.occurredAt,
+      phase,
+      situation: trace.situation,
+      actions: trace.actions?.length ? trace.actions : trace.details.slice(0, 2),
+      details: trace.details,
+      unfinished: trace.unfinished,
+      // Older life cards may retain what a participant raised, but never a
+      // model-drafted response. Immediate cards carry delivery-grounded reply
+      // semantics when that information is needed.
+      exchange: userMeaning ? { userMeaning, status: trace.exchange?.status === 'none' ? 'none' : 'open' } : undefined,
+    })
+  }
+  const selected: RecentLifeFact[] = []
+  let remaining = Math.max(600, characterBudget)
+  for (let index = candidates.length - 1; index >= 0 && selected.length < Math.max(1, limit) && remaining > 0; index--) {
+    const fact = fitRecentLifeFact(candidates[index], remaining)
+    const size = recentLifeFactSize(fact)
+    if (!size) continue
+    selected.unshift(fact)
+    remaining -= size
+  }
+  return selected
+}
+
+function fitRecentLifeFact(fact: RecentLifeFact, remaining: number): RecentLifeFact {
+  const text = (value: string, limit: number) => clip(value.replace(/\s+/g, ' ').trim(), limit)
+  const list = (items: string[], itemLimit: number, count: number) => items.map(item => text(item, itemLimit)).filter(Boolean).slice(-count)
+  const compact: RecentLifeFact = {
+    ...fact,
+    situation: text(fact.situation, 220),
+    actions: list(fact.actions, 150, 3),
+    details: list(fact.details, 150, 5),
+    unfinished: list(fact.unfinished, 180, 3),
+    exchange: fact.exchange ? { userMeaning: text(fact.exchange.userMeaning ?? '', 180), status: fact.exchange.status } : undefined,
+  }
+  const maximum = Math.max(160, Math.min(500, remaining))
+  while (recentLifeFactSize(compact) > maximum) {
+    if (compact.details.length) compact.details.shift()
+    else if (compact.unfinished.length > 1) compact.unfinished.shift()
+    else if (compact.actions.length > 1) compact.actions.shift()
+    else if (compact.exchange?.userMeaning && compact.exchange.userMeaning.length > 100) compact.exchange.userMeaning = text(compact.exchange.userMeaning, 100)
+    else if (compact.situation.length > 100) compact.situation = text(compact.situation, Math.max(100, compact.situation.length - 60))
+    else break
+  }
+  return compact
+}
+
+function recentLifeFactSize(fact: RecentLifeFact) {
+  return fact.situation.length
+    + fact.actions.reduce((sum, item) => sum + item.length, 0)
+    + fact.details.reduce((sum, item) => sum + item.length, 0)
+    + fact.unfinished.reduce((sum, item) => sum + item.length, 0)
+    + (fact.exchange?.userMeaning?.length ?? 0)
 }
 
 function isDeliveredTurnMessage(entry: ScriptEntry, turnEntryId: number) {
@@ -4055,9 +4176,51 @@ function logicalTurnInteractionState(entry: ScriptEntry, deliveredCount: number)
   return reply.mode === 'delayed' ? 'scheduled' : 'none'
 }
 
+/**
+ * Pre-refactor rows have no semantic exchange trace.  Keep their observed
+ * user wording, but turn any delivered reply into a neutral delivery fact so
+ * old short bubbles cannot become in-context wording examples after upgrade.
+ */
+function legacyConversationTrace(userMessages: string[], characterMessages: string[], status: RecentLogicalTurn['interactionState']) {
+  const userMeaning = userMessages.length ? clip(userMessages.join(' / ').replace(/\s+/g, ' ').trim(), 220) : ''
+  const responseMeaning = characterMessages.length
+    ? '主角已向参与者作出可见回应；具体措辞以已投递聊天记录为准。'
+    : ''
+  if (!userMeaning && !responseMeaning && status === 'none') return undefined
+  return {
+    userMeaning: userMeaning || undefined,
+    responseMeaning: responseMeaning || undefined,
+    status: status === 'sent' ? 'answered' : status === 'seen-no-reply' || status === 'unseen' || status === 'scheduled' ? 'open' : 'none',
+  } as const
+}
+
+/**
+ * A writer may draft a reply before transport succeeds.  Later context must
+ * never treat that draft as something the participant has already learned.
+ * Keep the user's meaning in either case; expose the response meaning only
+ * after the corresponding bubble is confirmed delivered.
+ */
+function deliveryGroundedConversationTrace(
+  trace: SceneTrace['exchange'] | undefined,
+  userMessages: string[],
+  characterMessages: string[],
+  status: RecentLogicalTurn['interactionState'],
+) {
+  if (characterMessages.length) return trace ?? legacyConversationTrace(userMessages, characterMessages, status)
+  const userMeaning = trace?.userMeaning || (userMessages.length
+    ? clip(userMessages.join(' / ').replace(/\s+/g, ' ').trim(), 220)
+    : '')
+  if (!userMeaning && status === 'none') return undefined
+  return {
+    userMeaning: userMeaning || undefined,
+    status: status === 'seen-no-reply' ? 'acknowledged' : status === 'none' ? 'none' : 'open',
+  } as const
+}
+
 /** Keep cards dense enough to preserve many complete turns.  The most useful
- * facts (current situation, completed actions, delivery state) survive first;
- * message text is shortened only when a very dense conversation needs it. */
+ * facts (current situation, completed actions, delivery state) survive first.
+ * Delivered bubble text remains available for auditing, but is excluded from
+ * the prompt budget so it cannot crowd out state or become a style example. */
 function fitLogicalTurnCard(card: RecentLogicalTurn, remaining: number): RecentLogicalTurn {
   const text = (value: string, limit: number) => clip(value.replace(/\s+/g, ' ').trim(), limit)
   const list = (items: string[], itemLimit: number, count: number) => items.map(item => text(item, itemLimit)).filter(Boolean).slice(-count)
@@ -4069,6 +4232,11 @@ function fitLogicalTurnCard(card: RecentLogicalTurn, remaining: number): RecentL
     unfinished: list(card.unfinished, 160, 3),
     userMessages: list(card.userMessages, 240, 3),
     characterMessages: list(card.characterMessages, 220, 4),
+    exchange: card.exchange ? {
+      userMeaning: text(card.exchange.userMeaning ?? '', 220),
+      responseMeaning: text(card.exchange.responseMeaning ?? '', 220),
+      status: card.exchange.status,
+    } : undefined,
     participantFacts: (card.participantFacts ?? []).map(item => ({
       fact: text(item.fact, 140), evidenceIds: item.evidenceIds.slice(0, 4),
     })).filter(item => item.fact).slice(0, 3),
@@ -4078,7 +4246,6 @@ function fitLogicalTurnCard(card: RecentLogicalTurn, remaining: number): RecentL
     if (compact.details.length) compact.details.shift()
     else if (compact.participantFacts?.length) compact.participantFacts.shift()
     else if (compact.unfinished.length > 1) compact.unfinished.shift()
-    else if (compact.characterMessages.length > 1) compact.characterMessages.shift()
     else if (compact.userMessages.length > 1) compact.userMessages.shift()
     else if (compact.actions.length > 1) compact.actions.shift()
     else if (compact.situation.length > 120) compact.situation = text(compact.situation, Math.max(120, compact.situation.length - 60))
@@ -4093,7 +4260,8 @@ function logicalTurnCardSize(card: RecentLogicalTurn) {
     + card.details.reduce((sum, item) => sum + item.length, 0)
     + card.unfinished.reduce((sum, item) => sum + item.length, 0)
     + card.userMessages.reduce((sum, item) => sum + item.length, 0)
-    + card.characterMessages.reduce((sum, item) => sum + item.length, 0)
+    + (card.exchange?.userMeaning?.length ?? 0)
+    + (card.exchange?.responseMeaning?.length ?? 0)
     + (card.participantFacts ?? []).reduce((sum, item) => sum + item.fact.length, 0)
 }
 
@@ -4174,9 +4342,22 @@ function normalizeSceneTrace(value: unknown): SceneTrace | undefined {
   const actions = list(value.actions, 180).slice(0, 4)
   const details = list(value.details, 220).slice(0, 6)
   const unfinished = list(value.unfinished, 240).slice(0, 4)
+  const exchange = normalizeConversationTrace(value.exchange)
   const participantFacts = normalizeParticipantTraceFacts(value.participantFacts)
-  if (!situation && !actions.length && !details.length && !unfinished.length && !participantFacts.length) return undefined
-  return { situation, actions, details, unfinished, participantFacts }
+  if (!situation && !actions.length && !details.length && !unfinished.length && !exchange && !participantFacts.length) return undefined
+  return { situation, actions, details, unfinished, exchange, participantFacts }
+}
+
+function normalizeConversationTrace(value: unknown): SceneTrace['exchange'] | undefined {
+  if (!isRecord(value)) return undefined
+  const text = (item: unknown) => typeof item === 'string' ? clip(item.replace(/\s+/g, ' ').trim(), 260) : ''
+  const userMeaning = text(value.userMeaning)
+  const responseMeaning = text(value.responseMeaning)
+  const status = value.status === 'answered' || value.status === 'acknowledged' || value.status === 'open' || value.status === 'none'
+    ? value.status
+    : undefined
+  if (!userMeaning && !responseMeaning && !status) return undefined
+  return { userMeaning: userMeaning || undefined, responseMeaning: responseMeaning || undefined, status }
 }
 
 function normalizeStoryHook(value: unknown): StoryHook | undefined {

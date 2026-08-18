@@ -178,10 +178,14 @@ const Runtime: Schema<RuntimeConfig> = Schema.object({
   sweepIntervalMinutes: Schema.natural().min(1).max(1_440).default(5).description('后台扫描周期；仅用于发现到期任务，不代表每轮都调用模型。'),
   minimumAdvanceMinutes: Schema.natural().min(1).max(10_080).default(30).description('手动“interlude.advance”的最小有效补写间隔；到期计划和对话后的短期补写不受此限制。'),
   maxStoriesPerSweep: Schema.natural().min(1).max(1_000).default(20).description('单轮后台扫描最多处理的主剧本数量。'),
-  contextEntryLimit: Schema.natural().min(1).max(200).default(30).description('主模型最多读取的近期事实卡数量。不会把原剧本正文作为实时上下文。'),
-  contextCharacterBudget: Schema.natural().min(1_000).max(50_000).default(6_000).description('近期事实卡与短期对话上下文的合计字符预算。默认 6000 通常足以保留近期小事。'),
-  interactionLedgerLimit: Schema.natural().min(2).max(24).default(12).description('近期逻辑回合卡的最大数量。一张卡合并一批用户消息、主角已送达的分段消息和当时生活状态。'),
-  interactionLedgerCharacterBudget: Schema.natural().min(200).max(4_000).default(2_400).description('近期逻辑回合卡的字符预算。卡片只保留事实和已送达消息，不回传原剧本正文。建议 1800–2400。'),
+  contextEntryLimit: Schema.natural().min(1).max(200).default(30).description('主模型扫描近期记录的数量上限。不会把原剧本正文作为实时上下文。'),
+  contextCharacterBudget: Schema.natural().min(1_000).max(50_000).default(6_000).description('短期交流事实与当前事件的合计字符预算。默认值通常足以保留当前对话。'),
+  interactionLedgerLimit: Schema.natural().min(2).max(24).default(12).description('近期逻辑回合卡数量。它保留刚发生的用户语义、已送达结论与当时生活状态。'),
+  interactionLedgerCharacterBudget: Schema.natural().min(200).max(4_000).default(2_400).description('近期逻辑回合卡字符预算。它不回传旧剧本文字或历史回复原句。建议 1800–2400。'),
+  recentLifeFactsEnabled: Schema.boolean().default(true).description('保留最近生活事实桥。它让主模型知道昨晚或当天较早发生的具体事情，不会回传旧剧本文字。'),
+  recentLifeFactHours: Schema.natural().min(6).max(168).default(36).description('近期生活事实保留的时间范围，默认 36 小时，足以覆盖昨晚到今天的连续生活。'),
+  recentLifeFactLimit: Schema.natural().min(4).max(60).default(20).description('单次主模型最多读取多少条较早的生活事实。数值更高会增强日内连续性，也会增加上下文。'),
+  recentLifeFactCharacterBudget: Schema.natural().min(600).max(6_000).default(2_400).description('近期生活事实的字符预算。默认 2400；优先保留动作、地点、人物、约定与未完事项。'),
   memoryLimit: Schema.natural().min(1).max(200).default(20).description('主模型读取的长期事实数量；会经过相关性重排。'),
   maxScriptCharacters: Schema.natural().min(500).max(12_000).default(8_000).description('单次写作允许追加的剧本文本上限。'),
   maxMessageCharacters: Schema.natural().min(1).max(12_000).default(2_000).description('单条可见消息的最大字符数。'),
@@ -451,15 +455,17 @@ function registerCommands(ctx: Context, service: InterludeService) {
       const story = await requireStory(service, session)
       if (typeof story === 'string') return story
       const participant = await service.findParticipant(session, story)
-      const [scene, arc, facts, recentTurns] = await Promise.all([
+      const [scene, arc, facts, recentTurns, recentLifeFacts] = await Promise.all([
         service.activeScene(story.id), service.activeArc(story.id), service.facts(story.id, 8, '', participant?.id),
         service.recentLogicalTurns(story.id, participant?.id),
+        service.recentLifeFacts(story.id, participant?.id),
       ])
       const visibleTurns = recentTurns.slice(-6)
       const participantFacts = visibleTurns.flatMap(turn => turn.participantFacts ?? []).slice(-6)
       return [
         `剧本引子：${story.state.storyHook ? JSON.stringify(story.state.storyHook) : '等待首次常规空闲推进生成'}`,
         `近期逻辑回合卡：${visibleTurns.length ? JSON.stringify(visibleTurns) : '尚未生成'}`,
+        `近期生活事实桥：${recentLifeFacts.length ? JSON.stringify(recentLifeFacts) : '尚未生成或已关闭'}`,
         `可追溯参与者事实：${participantFacts.length ? JSON.stringify(participantFacts) : '近期没有需要延续的参与者事实'}`,
         `场景引子：${scene?.hook || '尚未整理'}`,
         `场景摘要：${scene?.summary || '尚未整理'}`,

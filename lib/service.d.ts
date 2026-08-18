@@ -1,6 +1,6 @@
 import { Context, Service, Session } from 'koishi';
 import { ModelConfig } from './narrator';
-import { InterludeArc, InterludeScene, InterludeParticipant, InterludeStory, NarrativeFact, NarrativeIntent, NarrativeProvider, NarrativeCompactor, NarrativeEmbedder, OutgoingMessageDraft, RecentLogicalTurn, StatePatchProposal, StoryHook, StorySetting, StoryState, OverlaySnapshot } from './types';
+import { InterludeArc, InterludeScene, InterludeParticipant, InterludeStory, NarrativeFact, NarrativeIntent, NarrativeProvider, NarrativeCompactor, NarrativeEmbedder, OutgoingMessageDraft, RecentLifeFact, RecentLogicalTurn, StatePatchProposal, StoryHook, StorySetting, StoryState, OverlaySnapshot } from './types';
 export interface Config {
     model: ModelConfig;
     runtime: RuntimeConfig;
@@ -116,6 +116,11 @@ export interface RuntimeConfig {
     /** Number and character budget for factual, delivery-grounded logical turns. */
     interactionLedgerLimit?: number;
     interactionLedgerCharacterBudget?: number;
+    /** Factual life bridge for the previous day; it excludes transcript wording. */
+    recentLifeFactsEnabled?: boolean;
+    recentLifeFactHours?: number;
+    recentLifeFactLimit?: number;
+    recentLifeFactCharacterBudget?: number;
     memoryLimit: number;
     maxScriptCharacters: number;
     maxMessageCharacters: number;
@@ -334,9 +339,18 @@ export declare class InterludeService extends Service {
         createdAt: Date;
     }>;
     recentEntries(storyId: string, limit?: number): Promise<any[]>;
+    /**
+     * Read only narrator script rows for the recent-life bridge.  This avoids
+     * scanning every split chat bubble just to recover what happened last night.
+     * The result is still transformed into short factual cards before it reaches
+     * the model.
+     */
+    private recentSceneTraceEntries;
     /** Inspect the same factual turn cards used by the live narrator.  This is
      * intentionally read-only and keeps raw script prose out of the result. */
     recentLogicalTurns(storyId: string, participantId?: string): Promise<RecentLogicalTurn[]>;
+    /** Read-only inspection of the transcript-free daily life bridge. */
+    recentLifeFacts(storyId: string, participantId?: string): Promise<RecentLifeFact[]>;
     memories(storyId: string, limit?: number, participantId?: string): Promise<any[]>;
     /** Administrative view: includes global and participant-specific durable facts. */
     adminFacts(storyId: string, limit?: number): Promise<import("minato").FlatPick<NarrativeFact, any>[]>;

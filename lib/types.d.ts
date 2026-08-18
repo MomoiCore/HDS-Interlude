@@ -91,8 +91,22 @@ export interface SceneTrace {
     actions?: string[];
     details: string[];
     unfinished: string[];
+    /**
+     * The semantic result of a private exchange. This is deliberately factual
+     * rather than a copy of a chat bubble, so later turns can retain what was
+     * understood without learning the writer's earlier wording and cadence.
+     */
+    exchange?: ConversationTrace;
     /** User-related continuity notes. Every item must cite an input evidence id. */
     participantFacts?: ParticipantTraceFact[];
+}
+export interface ConversationTrace {
+    /** What the participant meant, asked, asserted, or referred to. */
+    userMeaning?: string;
+    /** What the protagonist actually conveyed or decided in response. */
+    responseMeaning?: string;
+    /** Whether the exchange is settled, intentionally open, or not applicable. */
+    status?: 'answered' | 'acknowledged' | 'open' | 'none';
 }
 /**
  * One compact, delivery-grounded continuity card for a completed writing
@@ -112,10 +126,28 @@ export interface RecentLogicalTurn {
     userMessages: string[];
     /** Only bubbles confirmed by the adapter as delivered. */
     characterMessages: string[];
+    /** Compact meaning of the exchange, never a transcript of old reply wording. */
+    exchange?: ConversationTrace;
     /** Lets an aftermath pass distinguish a settled exchange from an open one. */
     interactionState: 'sent' | 'seen-no-reply' | 'unseen' | 'scheduled' | 'none';
     /** User-related continuity notes. Every item cites observed input evidence. */
     participantFacts?: ParticipantTraceFact[];
+}
+/**
+ * A compact chronological fact from the current life period.  Unlike a
+ * logical turn it carries no chat transcript, so it can bridge last night or
+ * earlier the same day without feeding old authored wording back to the
+ * narrator.
+ */
+export interface RecentLifeFact {
+    entryId: number;
+    occurredAt: Date;
+    phase: NarrativePhase;
+    situation: string;
+    actions: string[];
+    details: string[];
+    unfinished: string[];
+    exchange?: ConversationTrace;
 }
 /**
  * Ground-truth material about a participant. The writer may use it to
@@ -464,6 +496,8 @@ export interface NarrativeRequest {
     storyHook?: StoryHook;
     /** Factual, delivery-grounded recent logical turns; no previous script prose. */
     recentLogicalTurns: RecentLogicalTurn[];
+    /** Factual life bridge for the recent day, intentionally without chat wording. */
+    recentLifeFacts: RecentLifeFact[];
     /** Observed participant material, deliberately separate from authored prose. */
     participantKnownFacts: ParticipantKnownFact[];
     memories: NarrativeMemory[];

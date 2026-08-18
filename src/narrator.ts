@@ -687,9 +687,9 @@ function systemPrompt(phase: NarrativeRequest['phase'], mainPrompt: string | und
   return [
     'HDS INTERLUDE WRITING CONTRACT (fixed by the plugin):',
     'You are the main author of a continuous, protagonist-centered realistic life script. Write the life that reaches the supplied now time, then make the structured interaction decision inside the same JSON object.',
-    'Return JSON only. Include script and a factual sceneTrace shaped as {"situation":"current situation at the end of this turn","actions":["completed protagonist action"],"details":["short protagonist, cast or world fact"],"unfinished":["specific unfinished matter"],"participantFacts":[{"fact":"compact participant-related fact","evidenceIds":["an id from participantKnownFacts"]}]}. sceneTrace is a continuity card, not prose: record 1-4 completed protagonist actions plus concrete state changes in concise fresh wording; preserve exact names, times, numbers and commitments when they matter.',
+    'Return JSON only. Include script and a factual sceneTrace shaped as {"situation":"current situation at the end of this turn","actions":["completed protagonist action"],"details":["short protagonist, cast or world fact"],"unfinished":["specific unfinished matter"],"exchange":{"userMeaning":"what the current participant meant or asked","responseMeaning":"the factual information, stance or decision actually conveyed to them","status":"answered|acknowledged|open|none"},"participantFacts":[{"fact":"compact participant-related fact","evidenceIds":["an id from currentEvent.messages"]}]}. sceneTrace is a continuity card, not prose: record 1-4 completed protagonist actions plus concrete state changes in concise fresh wording; preserve exact names, times, numbers and commitments when they matter. For a private exchange, exchange is a compact meaning record rather than a quotation: state what was understood and what was actually conveyed, and mark whether it is settled or remains open.',
     hookUpdate === 'full'
-      ? 'This quiet-life turn performs a full story hook refresh. Include {"storyHook":{"currentLife":"where life continues now","presentState":["place, activity, body, mood or schedule"],"ongoingThreads":["ongoing life thread"],"castAndRelations":["current supporting-cast or relationship state"],"unresolvedMatters":["open matter"],"recentFacts":["recent concrete detail"],"participantMatters":[{"fact":"compact participant-related fact","evidenceIds":["an id from participantKnownFacts"]}]}}. Build it from established context plus this completed turn, using compact factual notes.'
+      ? 'This quiet-life turn performs a full story hook refresh. Include {"storyHook":{"currentLife":"where life continues now","presentState":["place, activity, body, mood or schedule"],"ongoingThreads":["ongoing life thread"],"castAndRelations":["current supporting-cast or relationship state"],"unresolvedMatters":["open matter"],"recentFacts":["recent concrete detail"],"participantMatters":[{"fact":"compact participant-related fact","evidenceIds":["an id from currentEvent.messages"]}]}}. Build it from established context plus this completed turn, using compact factual notes.'
       : hookUpdate === 'patch'
         ? 'This is the settled end of a conversation cycle. Include a small {"storyHookPatch":{...}} containing only hook fields whose meaning changed in this aftermath. Available fields are currentLife, presentState, ongoingThreads, castAndRelations, unresolvedMatters, recentFacts and participantMatters. Omit unchanged fields; use short factual notes. The plugin merges this patch into the existing hook, so do not repeat the full hook.'
         : 'Use storyHook as the stable starting point for this turn. This turn returns sceneTrace and leaves storyHook unchanged.',
@@ -697,7 +697,7 @@ function systemPrompt(phase: NarrativeRequest['phase'], mainPrompt: string | und
     'Optional fields are memories, intents, intentUpdates, browserIntents, statePatch, crossConversationActions and groupReply. The plugin owns transport records, so visible private messages use interaction.reply and permitted cross-account contact uses crossConversationActions.',
     'Use interval.storyLocal as the character’s experienced calendar and clock; interval UTC values are the exact transport reference. script contains events already reached by now. Future possibilities remain plans, hesitations, intents, or delayed actions with a complete ISO-8601 time after now.',
     'Build each scene from the protagonist’s current activity, surroundings, body, mood, practical pressures, interests and supporting cast. Let concrete life and small changes supply the movement. A user message enters that existing life as one external event and receives the amount of attention that the present situation naturally gives it.',
-    'storyHook, recentLogicalTurns, memories, durableFacts, overlayEvolution and bootstrapContext are established background facts. Use their information while composing new prose from the current situation; recentLogicalTurns are continuity cards rather than examples of wording or scene structure. Each card combines the protagonist’s completed actions and scene state with exact observed user messages and only character bubbles confirmed as delivered. Read their chronological chain before writing: interactionState=sent or seen-no-reply records a settled exchange, scheduled records an existing plan, and unfinished carries the matters that still need life or conversation to resolve. participantKnownFacts is the observed ledger for a participant’s identity and durable history. When a participant-related fact is worth carrying into sceneTrace, storyHook or storyHookPatch, place it in participantFacts or participantMatters with the matching source ids from that ledger. This keeps participant continuity concrete while allowing the protagonist’s own life to remain richly written.',
+    'storyHook, recentLogicalTurns, recentLifeFacts, continuityFacts, overlayEvolution and bootstrapContext are established background facts. Use their information while composing new prose from the current situation. recentLogicalTurns are immediate continuity cards rather than examples of wording or scene structure. Each card combines completed actions, scene state, exact observed user messages, a factual exchange meaning, and delivery count. Earlier character bubble wording is intentionally absent: exchange.responseMeaning records the information or stance already conveyed, while deliveredMessageCount confirms it reached the participant. recentLifeFacts is the wider chronological bridge for the recent day: it preserves concrete actions, places, people, commitments, changes and unfinished matters without transcript wording. continuityFacts is a de-duplicated union of durable facts and archived memories. Read both time chains before writing, especially when the current event refers to last night, an earlier plan, a place, a person, or something the protagonist just did. interactionState=sent or seen-no-reply records a settled exchange, scheduled records an existing plan, and unfinished carries matters that still need life or conversation to resolve. When a current user message returns to a settled subject, carry the established meaning forward and add a fresh, relevant contribution through clarification, changed circumstances, feeling, action, question or acknowledgement. currentEvent.messages is the observed inbound-event ledger; when a participant-related fact is worth carrying into sceneTrace, storyHook or storyHookPatch, place it in participantFacts or participantMatters with matching ids from those messages. This keeps participant continuity concrete while allowing the protagonist’s own life to remain richly written.',
     'currentEvent, dueIntents and newly collected webContext are the observed event ledger for this interval. A no-event currentEvent supports a complete passage made from the protagonist’s own actions, encounters, choices and thoughts. Contact from another person becomes a current event only when it appears in currentEvent; an absent person can still be remembered, expected or wondered about as the protagonist’s own thought.',
     'For phase user-message, currentEvent is the newly received batch. First connect the already elapsed life from interval.from to interval.now, then place the batch into that reality and make one coherent decision. Several short messages in the batch form one external event.',
     'When currentEvent.imageCount is positive, the attached native image inputs belong to this current event. Describe only visible supported details. When it is zero, the current event contains no visual material.',
@@ -728,6 +728,56 @@ function toPromptPayload(request: NarrativeRequest) {
   // Live context is factual by construction: stable hook + short per-turn
   // deltas + the explicit current event. The full script remains in storage
   // and is intentionally absent here, preventing self-style amplification.
+  // The live payload uses one owner for each fact category.  In particular,
+  // user/relationship baselines do not repeat inside setting, and durable
+  // facts/memories merge into one de-duplicated ledger.
+  const { user: _legacyUser, relationship: _legacyRelationship, ...setting } = request.story.setting
+  const participantEvidence = request.participantKnownFacts.map(fact => ({
+    id: fact.id, participantId: fact.participantId, source: fact.source,
+    fact: fact.fact, occurredAt: fact.occurredAt?.toISOString(),
+  }))
+  const recentLogicalTurns = request.recentLogicalTurns.map(turn => ({
+    entryId: turn.entryId, participantId: turn.participantId, phase: turn.phase,
+    occurredAt: turn.occurredAt.toISOString(), interactionState: turn.interactionState,
+    situation: turn.situation, actions: turn.actions, details: turn.details,
+    unfinished: turn.unfinished, userMessages: turn.userMessages,
+    exchange: turn.exchange ?? null,
+    deliveredMessageCount: turn.characterMessages.length,
+    participantFacts: turn.participantFacts ?? [],
+  }))
+  const recentLifeFacts = request.recentLifeFacts.map(fact => ({
+    entryId: fact.entryId, occurredAt: fact.occurredAt.toISOString(), phase: fact.phase,
+    situation: fact.situation, actions: fact.actions, details: fact.details,
+    unfinished: fact.unfinished, exchange: fact.exchange ?? null,
+  }))
+  const continuityFacts = compactContinuityFacts(request.memories, request.facts ?? [], 6_000)
+  const overlayEvolution = compactPromptRecords((request.overlaySnapshots ?? []).map(snapshot => ({
+    content: snapshot.summary, target: snapshot.target, tier: snapshot.tier, participantId: snapshot.participantId,
+    periodStart: snapshot.periodStart.toISOString(), periodEnd: snapshot.periodEnd.toISOString(), majorEvents: snapshot.majorEvents,
+  })), 8_000)
+  const webContext = compactPromptRecords((request.webContext ?? []).map(observation => ({
+    ...observation,
+    // Reuse the generic budgeter without exposing a separate unbounded
+    // copy of the same page text in the prompt payload.
+    content: observation.excerpt || observation.summary,
+  })), 8_000).map(observation => ({
+    mode: observation.mode, query: observation.query, url: observation.url, title: observation.title,
+    excerpt: observation.excerpt, summary: observation.summary, status: observation.status,
+    accessedAt: observation.accessedAt.toISOString(),
+  }))
+  const currentEvent = request.phase === 'advance' || request.phase === 'conversation-follow-up'
+    ? { type: 'none' }
+    : request.groupContext
+      ? { type: 'group-message-batch', content: request.userMessage ?? '' }
+      : request.phase === 'user-message'
+        ? {
+            type: 'private-message-batch',
+            messages: participantEvidence.length
+              ? participantEvidence.map(item => ({ id: item.id, content: item.fact, occurredAt: item.occurredAt }))
+              : [{ id: 'current-event', content: request.userMessage ?? '' }],
+            imageCount: request.images?.length ?? 0,
+          }
+        : { type: 'due-intents' }
   return {
     phase: request.phase,
     hookUpdate: request.hookUpdate ?? (request.refreshStoryHook ? 'full' : 'none'),
@@ -737,29 +787,16 @@ function toPromptPayload(request: NarrativeRequest) {
       fromLocal: formatStoryTime(request.from, request.story.setting.timezone),
       nowLocal: formatStoryTime(request.now, request.story.setting.timezone),
     },
-    // In shared mode the legacy setting.user/relationship fields are only
-    // defaults. Replace them with the current relationship so one account
-    // never receives another account's private relationship context.
-    setting: request.participant ? {
-      ...request.story.setting,
-      user: { displayName: request.participant.displayName, profile: request.participant.profile },
-      relationship: request.participant.relationship,
-    } : request.story.setting,
-    stableState: { settingOverlay: request.story.state.settingOverlay },
+    // Participant-specific baseline lives in currentParticipant. Keeping it
+    // out of setting prevents the same profile and relationship from being
+    // transmitted twice in every private turn.
+    setting,
+    stableState: request.story.state.settingOverlay ? { settingOverlay: request.story.state.settingOverlay } : undefined,
     storyHook: request.storyHook ?? null,
     currentParticipant: request.participant ? participantPromptPayload(request.participant, true) : null,
-    participants: request.participants.map(participant => participantPromptPayload(participant, false)),
-    recentLogicalTurns: request.recentLogicalTurns.map(turn => ({
-      entryId: turn.entryId, participantId: turn.participantId, phase: turn.phase,
-      occurredAt: turn.occurredAt.toISOString(), interactionState: turn.interactionState,
-      situation: turn.situation, actions: turn.actions, details: turn.details,
-      unfinished: turn.unfinished, userMessages: turn.userMessages,
-      characterMessages: turn.characterMessages, participantFacts: turn.participantFacts ?? [],
-    })),
-    participantKnownFacts: request.participantKnownFacts.map(fact => ({
-      id: fact.id, participantId: fact.participantId, source: fact.source,
-      fact: fact.fact, occurredAt: fact.occurredAt?.toISOString(),
-    })),
+    participants: request.participants.length ? request.participants.map(participant => participantPromptPayload(participant, false)) : undefined,
+    recentLogicalTurns: recentLogicalTurns.length ? recentLogicalTurns : undefined,
+    recentLifeFacts: recentLifeFacts.length ? recentLifeFacts : undefined,
     bootstrapContext: request.bootstrapContext ? {
       scene: request.bootstrapContext.scene ? {
         hook: request.bootstrapContext.scene.hook,
@@ -771,13 +808,7 @@ function toPromptPayload(request: NarrativeRequest) {
       } : null,
       recentExcerpt: request.bootstrapContext.recentExcerpt,
     } : undefined,
-    currentEvent: request.phase === 'advance' || request.phase === 'conversation-follow-up'
-      ? { type: 'none' }
-      : request.groupContext
-        ? { type: 'group-message-batch', content: request.userMessage ?? '' }
-        : request.phase === 'user-message'
-          ? { type: 'private-message-batch', content: request.userMessage ?? '', imageCount: request.images?.length ?? 0 }
-          : { type: 'due-intents' },
+    currentEvent,
     groupContext: request.groupContext ? {
       ...request.groupContext,
       // Main writing receives user-side group context only. Previous
@@ -788,14 +819,14 @@ function toPromptPayload(request: NarrativeRequest) {
         occurredAt: message.occurredAt.toISOString(), direction: message.direction,
       })),
     } : undefined,
-    dueIntents: request.dueIntents.map(intent => ({
+    dueIntents: request.dueIntents.length ? request.dueIntents.map(intent => ({
       type: intent.type,
       participantId: intent.participantId,
       summary: intent.summary,
       notBefore: intent.notBefore.toISOString(),
       payload: intent.payload,
-    })),
-    activeConsequences: request.activeConsequences.map(intent => ({
+    })) : undefined,
+    activeConsequences: request.activeConsequences.length ? request.activeConsequences.map(intent => ({
       id: intent.id,
       participantId: intent.participantId,
       summary: intent.summary,
@@ -803,33 +834,16 @@ function toPromptPayload(request: NarrativeRequest) {
       effect: typeof intent.payload?.effect === 'string' ? intent.payload.effect : '',
       strength: typeof intent.payload?.strength === 'number' ? intent.payload.strength : 0.5,
       expiresAt: typeof intent.payload?.expiresAt === 'string' ? intent.payload.expiresAt : '',
-    })),
-    supersededDelayedReplies: request.supersededIntents.map(intent => ({
+    })) : undefined,
+    supersededDelayedReplies: request.supersededIntents.length ? request.supersededIntents.map(intent => ({
       participantId: intent.participantId,
       summary: intent.summary,
       notBefore: intent.notBefore.toISOString(),
       payload: intent.payload,
-    })),
-    memories: compactPromptRecords(request.memories, 6_000).map(memory => ({
-      participantId: memory.participantId, category: memory.category, content: memory.content, importance: memory.importance,
-    })),
-    durableFacts: compactPromptRecords(request.facts ?? [], 8_000).map(fact => ({
-      participantId: fact.participantId, scope: fact.scope, content: fact.content, importance: fact.importance, confidence: fact.confidence,
-    })),
-    overlayEvolution: compactPromptRecords((request.overlaySnapshots ?? []).map(snapshot => ({
-      content: snapshot.summary, target: snapshot.target, tier: snapshot.tier, participantId: snapshot.participantId,
-      periodStart: snapshot.periodStart.toISOString(), periodEnd: snapshot.periodEnd.toISOString(), majorEvents: snapshot.majorEvents,
-    })), 8_000),
-    webContext: compactPromptRecords((request.webContext ?? []).map(observation => ({
-      ...observation,
-      // Reuse the generic budgeter without exposing a separate unbounded
-      // copy of the same page text in the prompt payload.
-      content: observation.excerpt || observation.summary,
-    })), 8_000).map(observation => ({
-      mode: observation.mode, query: observation.query, url: observation.url, title: observation.title,
-      excerpt: observation.excerpt, summary: observation.summary, status: observation.status,
-      accessedAt: observation.accessedAt.toISOString(),
-    })),
+    })) : undefined,
+    continuityFacts: continuityFacts.length ? continuityFacts : undefined,
+    overlayEvolution: overlayEvolution.length ? overlayEvolution : undefined,
+    webContext: webContext.length ? webContext : undefined,
   }
 }
 
@@ -874,6 +888,48 @@ function compactPromptRecords<T extends { content: string }>(records: T[], chara
     remaining -= content.length
   }
   return selected
+}
+
+/** Merge the two historical storage systems into one prompt ledger. Facts are
+ * already relevance-ranked by the service; archived memories then contribute
+ * only details that are not the same fact under a different table name. */
+function compactContinuityFacts(
+  memories: NarrativeRequest['memories'], facts: NonNullable<NarrativeRequest['facts']>, characterBudget: number,
+) {
+  type ContinuityFact = {
+    content: string
+    participantId: string
+    sources: string[]
+    labels: string[]
+    importance: number
+    confidence?: number
+    unresolved?: boolean
+  }
+  const selected = new Map<string, ContinuityFact>()
+  const normalize = (value: string) => value.trim().toLocaleLowerCase().replace(/\s+/g, ' ')
+  const add = (content: string, participantId: string, source: string, label: string, importance: number, confidence?: number, unresolved?: boolean) => {
+    const text = content.trim()
+    if (!text) return
+    const key = `${participantId}\u0000${normalize(text)}`
+    const existing = selected.get(key)
+    if (!existing) {
+      selected.set(key, {
+        content: text, participantId, sources: [source], labels: label ? [label] : [],
+        importance, confidence, unresolved,
+      })
+      return
+    }
+    if (!existing.sources.includes(source)) existing.sources.push(source)
+    if (label && !existing.labels.includes(label)) existing.labels.push(label)
+    existing.importance = Math.max(existing.importance, importance)
+    existing.confidence = Math.max(existing.confidence ?? 0, confidence ?? 0) || undefined
+    existing.unresolved = existing.unresolved || unresolved || undefined
+  }
+  // Facts go first because service.ts has already ranked them against the
+  // current event and unresolved plans; memories only fill unique gaps.
+  for (const fact of facts) add(fact.content, fact.participantId, 'fact', fact.scope, fact.importance, fact.confidence, fact.unresolved)
+  for (const memory of memories) add(memory.content, memory.participantId, 'memory', memory.category, memory.importance)
+  return compactPromptRecords([...selected.values()], characterBudget)
 }
 
 function participantPromptPayload(participant: NonNullable<NarrativeRequest['participant']>, includeCurrentDetails: boolean) {

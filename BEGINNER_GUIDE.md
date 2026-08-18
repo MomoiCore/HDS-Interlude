@@ -1,6 +1,6 @@
 # HDS Interlude 新手引导
 
-HDS Interlude 是 Koishi 的持续叙事聊天插件。插件使用共享主剧本保存角色状态、关系分支、已发生事件、待处理计划和长期记忆。用户消息会进入当前剧本回合；主模型在同一次请求中补写已过去的时间，并决定是否发送、延迟发送或暂不发送消息。实时写作使用“剧本引子 + 近期逻辑回合卡”，不会把成批旧剧本正文反复交给模型模仿。回合卡保留主角刚完成的行动、生活状态、用户实际消息与已送达回复；参与者自己的消息、资料和关系则通过独立的可追溯事实进入模型，因此剧情里的猜测不会自动被当成用户真的做过的事。
+HDS Interlude 是 Koishi 的持续叙事聊天插件。插件使用共享主剧本保存角色状态、关系分支、已发生事件、待处理计划和长期记忆。用户消息会进入当前剧本回合；主模型在同一次请求中补写已过去的时间，并决定是否发送、延迟发送或暂不发送消息。实时写作使用“剧本引子 + 近期逻辑回合卡 + 近期生活事实桥”，不会把成批旧剧本正文反复交给模型模仿。回合卡保留主角刚完成的行动、生活状态、用户实际消息，以及“本轮已经传达的结论”；生活事实桥保留昨晚和当天较早发生的具体事情。已送达回复的原句只留作数据库审计，不再成为下一轮的措辞示例。参与者资料与关系只在当前参与者层提供，长期事实与记忆会先合并去重；真实入站消息仍保留来源，因此剧情里的猜测不会自动被当成用户真的做过的事。
 
 ## 适用场景
 
@@ -61,9 +61,13 @@ model.embedding.enabled: false
 model.vision.enabled: true
 runtime.interactionLedgerLimit: 12
 runtime.interactionLedgerCharacterBudget: 2400
+runtime.recentLifeFactsEnabled: true
+runtime.recentLifeFactHours: 36
+runtime.recentLifeFactLimit: 20
+runtime.recentLifeFactCharacterBudget: 2400
 ```
 
-近期逻辑回合卡会让角色知道最近实际说过什么、已经完成什么事情，以及哪些事仍未结束。它不会把长篇旧剧本塞回主模型；默认值通常无需调整。
+近期逻辑回合卡会让角色知道刚刚发生了什么、已经完成什么事情、已经回应了什么结论，以及哪些事仍未结束。除此之外，“近期生活事实桥”会保留最近 36 小时内较早的时间、地点、行动、人物互动、约定和未完事项；例如角色可以据此回忆昨晚发生的具体事情。两者都不会把长篇旧剧本或旧回复原句塞回主模型；默认值通常无需调整。
 
 先在服务商列表填写连接信息，再在模型列表登记实际模型；后续各功能只需从模型预设下拉菜单选择即可：
 
@@ -187,6 +191,10 @@ runtime.narrativeRetryDelaySeconds: 60
 runtime.narrativeRetryMaxAttempts: 6
 runtime.contextEntryLimit: 30
 runtime.contextCharacterBudget: 6000
+runtime.recentLifeFactsEnabled: true
+runtime.recentLifeFactHours: 36
+runtime.recentLifeFactLimit: 20
+runtime.recentLifeFactCharacterBudget: 2400
 
 runtime.autoAdvanceEnabled: true
 runtime.autoAdvanceIntervalMinutes: 40
@@ -231,7 +239,7 @@ browser.enabled: false
 browser.mode: deferred-only
 ```
 
-默认上下文会扫描最多 30 条近期记录，并保留最多 12 张逻辑回合卡、2400 个字符的近期连续性。每张卡包含主角刚完成的行动、生活状态和实际收发消息。对话结束后的最后一次短期补写会对剧本引子做一个小修改；连续空闲满 4 小时后，下一次常规推进才完整重写引子。两种更新都复用已有写作回合，不会新增独立模型调用。
+默认上下文会扫描最多 30 条近期记录，并保留最多 12 张逻辑回合卡、2400 个字符的近期连续性。每张卡包含主角刚完成的行动、生活状态、用户实际消息和已处理的交流结论。对话结束后的最后一次短期补写会对剧本引子做一个小修改；连续空闲满 4 小时后，下一次常规推进才完整重写引子。两种更新都复用已有写作回合，不会新增独立模型调用。
 
 Embedding 可以在基础功能稳定后再开启。网页观察和 Puppeteer 也建议最后启用，以便区分模型、网络和浏览器问题。
 
@@ -263,7 +271,7 @@ logging.logMessageContent: false
 ## 常用管理指令
 
 - `interlude.status`：查看当前主剧本状态。
-- `interlude.context`：查看剧本引子、近期逻辑回合卡、可追溯参与者事实、场景摘要、关系状态和长期事实。
+- `interlude.context`：查看剧本引子、近期逻辑回合卡、近期生活事实桥、可追溯参与者事实、场景摘要、关系状态和长期事实。
 - `interlude.timeline`：查看当前账号相关的近期剧本条目。
 - `interlude.memory.intents`：查看延迟回复、提醒、承诺和剧情余波。
 - `interlude.pause` / `interlude.resume`：暂停或恢复后台处理。
