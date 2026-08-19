@@ -1,6 +1,6 @@
 import { Context, Service, Session } from 'koishi';
 import { ModelConfig } from './narrator';
-import { InterludeArc, InterludeScene, InterludeParticipant, InterludeStory, NarrativeFact, NarrativeIntent, NarrativeProvider, NarrativeCompactor, NarrativeEmbedder, OutgoingMessageDraft, RecentLifeFact, RecentLogicalTurn, StatePatchProposal, StoryHook, StorySetting, StoryState, OverlaySnapshot } from './types';
+import { InterludeArc, InterludeScene, InterludeParticipant, InterludeStory, NarrativeFact, NarrativeIntent, NarrativeProvider, NarrativeCompactor, NarrativeEmbedder, OutgoingMessageDraft, RecentLifeFact, RecentLogicalTurn, ActiveSceneContext, SceneStateSnapshot, StatePatchProposal, StoryHook, StorySetting, StoryState, OverlaySnapshot } from './types';
 export interface Config {
     model: ModelConfig;
     runtime: RuntimeConfig;
@@ -86,6 +86,11 @@ export interface MemoryConfig {
     activeConsequenceMaxDays: number;
     /** Used when the narrator omits a precise strength for a valid consequence. */
     activeConsequenceDefaultStrength: number;
+    /** One overwriteable short-term card connecting participant affect, the
+     * protagonist's situation, and the next communication posture. */
+    relationshipMomentEnabled?: boolean;
+    relationshipMomentDefaultHours?: number;
+    relationshipMomentMaxHours?: number;
     overlayCompressionEnabled?: boolean;
     overlayRecentDays?: number;
     overlayMonthlyAfterDays?: number;
@@ -111,6 +116,14 @@ export interface RuntimeConfig {
     minimumAdvanceMinutes: number;
     maxStoriesPerSweep: number;
     contextEntryLimit: number;
+    /** Maximum raw rows read from the current active scene. */
+    activeSceneEntryLimit?: number;
+    /** Maximum recent authored script passages sent as literary continuity. */
+    activeSceneNarrativeLimit?: number;
+    /** Character budget for verbatim current-scene prose and real messages. */
+    activeSceneCharacterBudget?: number;
+    /** Character budget retained from the immediately preceding scene. */
+    previousSceneTailCharacters?: number;
     /** Shared character budget for recent Scene Trace cards and follow-up user events. */
     contextCharacterBudget?: number;
     /** Number and character budget for factual, delivery-grounded logical turns. */
@@ -307,6 +320,9 @@ export declare class InterludeService extends Service {
             settingOverlay: import("./types").StorySettingOverlay;
             activeSceneId?: number;
             activeArcId?: number;
+            activeSceneState?: SceneStateSnapshot;
+            pendingSceneEventIds?: string[];
+            sceneTransitionPending?: import("./types").SceneTransitionRequest;
             storyHook?: StoryHook;
             storyHookEntryId?: number;
             storyHookAdvanceCount: number;
@@ -349,6 +365,9 @@ export declare class InterludeService extends Service {
     /** Inspect the same factual turn cards used by the live narrator.  This is
      * intentionally read-only and keeps raw script prose out of the result. */
     recentLogicalTurns(storyId: string, participantId?: string): Promise<RecentLogicalTurn[]>;
+    /** Read-only diagnostic view of the exact short-term source sent to the
+     * narrator. Content is already bounded by the active-scene Console limits. */
+    activeSceneSource(storyId: string, participantId?: string): Promise<ActiveSceneContext>;
     /** Read-only inspection of the transcript-free daily life bridge. */
     recentLifeFacts(storyId: string, participantId?: string): Promise<RecentLifeFact[]>;
     memories(storyId: string, limit?: number, participantId?: string): Promise<any[]>;
@@ -463,6 +482,10 @@ export declare class InterludeService extends Service {
      * the owner has explicitly enabled shared relationship details. */
     private webObservations;
     activeScene(storyId: string): Promise<InterludeScene | null>;
+    /** Build the verbatim short-term continuity source used by the main writer.
+     * Raw entries stay immutable; user-event state is derived from later script
+     * acknowledgements, so a crash can never silently mark a message handled. */
+    private loadActiveSceneContext;
     activeArc(storyId: string): Promise<InterludeArc | null>;
     private appendIntent;
     /** Active consequences share the intent table but are never scheduler work.
@@ -495,11 +518,27 @@ export declare class InterludeService extends Service {
     private withBrowserSlot;
     /** Persist a bounded retry so a transient provider failure cannot strand a user turn. */
     private scheduleNarrativeRetry;
+    /**
+     * Retries are a recovery mechanism for one failed foreground turn, never a
+     * second source of conversation. Cancel them as soon as that relationship
+     * receives a newer message or completes a later writing turn.
+     */
+    private cancelNarrativeRetries;
+    /**
+     * Compatibility guard for retry rows created before the explicit cleanup
+     * path existed. Once a later turn has advanced the story cursor past the
+     * retry's creation point, its original user event is already settled.
+     */
+    private discardObsoleteNarrativeRetries;
     private dueIntents;
     /** Wake the scheduler close to a short typing delay instead of waiting for
      * the normal background sweep. The due intent remains the source of truth. */
     private scheduleDueIntentWake;
     private scheduleNextSplitWake;
+    /** If a scheduler pause made several segments overdue, only the next index
+     * in this same turn receives a fresh typing delay. Later indices stay
+     * blocked behind it regardless of their older absolute timestamps. */
+    private restoreNextSplitDelay;
     /** Deliver already-decided <sep/> segments without invoking the narrator. */
     private deliverDueSplitSegments;
     private cancelPendingOutgoingMessages;
@@ -542,6 +581,8 @@ export declare class InterludeService extends Service {
     private getParticipant;
     private recordIncomingMessage;
     private markParticipantSeen;
+    /** Clear only the unread state that existed when this decision was made. */
+    private markParticipantSeenThrough;
     private recordCharacterMessage;
     private updateParticipantState;
     /** Converts one old account-bound story into a bot-bound shared story once. */
@@ -557,6 +598,7 @@ export declare class InterludeService extends Service {
     private get browserConfig();
     private ensureContinuity;
     private scheduleCompaction;
+    private finalizeSceneTransitionWithoutCompaction;
     private compactStories;
     private compactUnlocked;
     /** Older state patches are compacted only by the background maintenance

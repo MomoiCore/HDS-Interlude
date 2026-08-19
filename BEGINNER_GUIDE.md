@@ -1,6 +1,6 @@
 # HDS Interlude 新手引导
 
-HDS Interlude 是 Koishi 的持续叙事聊天插件。插件使用共享主剧本保存角色状态、关系分支、已发生事件、待处理计划和长期记忆。用户消息会进入当前剧本回合；主模型在同一次请求中补写已过去的时间，并决定是否发送、延迟发送或暂不发送消息。实时写作使用“剧本引子 + 近期逻辑回合卡 + 近期生活事实桥”，不会把成批旧剧本正文反复交给模型模仿。回合卡保留主角刚完成的行动、生活状态、用户实际消息，以及“本轮已经传达的结论”；生活事实桥保留昨晚和当天较早发生的具体事情。已送达回复的原句只留作数据库审计，不再成为下一轮的措辞示例。参与者资料与关系只在当前参与者层提供，长期事实与记忆会先合并去重；真实入站消息仍保留来源，因此剧情里的猜测不会自动被当成用户真的做过的事。
+HDS Interlude 是 Koishi 的持续叙事聊天插件。插件使用共享主剧本保存角色状态、关系分支、已发生事件、待处理计划和长期记忆。用户消息会进入当前活动场景；主模型在同一次请求中续写已经发生的生活，并决定是否发送、延迟发送或暂不发送消息。实时写作同时读取最近剧本原文、近期动作轨迹和对话前沿：剧本保留生活细节，轨迹保留发展过程，对话前沿保留用户原话与已经完成的回应含义。剧本引子、近期事实和长期记忆负责更早的历史。
 
 ## 适用场景
 
@@ -34,7 +34,8 @@ Console 页面从上到下就是推荐填写顺序：`storyDefaults` → `model`
 3. 测试延迟回复：用户再次发言后，旧延迟计划应取消并重新判断。
 4. 开启 `runtime.autoAdvanceEnabled`，使用 `interlude.advance` 检查自动回合的剧本和消息行为。
 5. 将两个 QQ 加入白名单，确认它们共享主剧本且各自保留关系资料。
-6. 最后启用记忆压缩、Embedding、群聊和 Puppeteer。
+6. 保持 `memory.relationshipMomentEnabled=true`，发送一条带有明确情绪、求助或约定的消息；再发送一条普通短句，确认角色会延续已发生的交流方向，但不会重复刚刚说过的关心或建议。
+7. 最后启用记忆压缩、Embedding、群聊和 Puppeteer。
 
 ## 推荐配置预设
 
@@ -59,15 +60,24 @@ model.failover.cooldownMinutes: 5
 model.groupGate.enabled: false
 model.embedding.enabled: false
 model.vision.enabled: true
-runtime.interactionLedgerLimit: 12
-runtime.interactionLedgerCharacterBudget: 2400
+runtime.interactionLedgerLimit: 18
+runtime.interactionLedgerCharacterBudget: 3600
+runtime.activeSceneEntryLimit: 400
+runtime.activeSceneNarrativeLimit: 20
+runtime.activeSceneCharacterBudget: 60000
+runtime.previousSceneTailCharacters: 4000
 runtime.recentLifeFactsEnabled: true
-runtime.recentLifeFactHours: 36
-runtime.recentLifeFactLimit: 20
-runtime.recentLifeFactCharacterBudget: 2400
+runtime.recentLifeFactHours: 48
+runtime.recentLifeFactLimit: 24
+runtime.recentLifeFactCharacterBudget: 3200
+memory.relationshipMomentEnabled: true
+memory.relationshipMomentDefaultHours: 24
+memory.relationshipMomentMaxHours: 168
 ```
 
-近期逻辑回合卡会让角色知道刚刚发生了什么、已经完成什么事情、已经回应了什么结论，以及哪些事仍未结束。除此之外，“近期生活事实桥”会保留最近 36 小时内较早的时间、地点、行动、人物互动、约定和未完事项；例如角色可以据此回忆昨晚发生的具体事情。两者都不会把长篇旧剧本或旧回复原句塞回主模型；默认值通常无需调整。
+`activeSceneEntryLimit` 只控制数据库扫描量；实际写作默认读取最近 20 段剧本，并固定保留未处理事件。近期逻辑回合同时提供生活关注面、动作发展、具体小细节、外部事件影响、用户表达含义和已经完成的回应。最近十个相关回合的真实收发消息会作为“已经发生的对话”提供，用来避免忘记刚说过的话；更早措辞只保留事实含义。“近期生活事实桥”默认补充最近 48 小时的事实。
+
+`relationshipMoment` 是一张按账号保存的短期关系卡，不是第二份人设或聊天记录。它只保存仍在作用的交流方向，例如“对方明显焦虑，角色已表达担心、接下来应先确认状况”；当前事件和角色所处生活仍然优先。默认 24 小时到期，最长不超过 168 小时。它由主模型在正常写作时顺带更新，不会增加一次模型调用。
 
 先在服务商列表填写连接信息，再在模型列表登记实际模型；后续各功能只需从模型预设下拉菜单选择即可：
 
@@ -96,28 +106,28 @@ model.models[].responseFormat: prompt-only
 
 ```text
 model.mainPrompt:
-以有丰富生活感和稍微突发奇想offset的行为、动机和人际关系为基础推动时光的流逝，延续以角色为中心的精彩生活剧本。
+持续创作一部以主角为中心的现实主义生活剧本。让日程、具体行动、身体节奏、兴趣、配角关系、现实压力、外部变化和未完事项共同推动时间，并让每个回合从既有生活中产生新的实际进展。
 ```
 
 全局文风提示词：
 
 ```text
 model.stylePrompt:
-你正在持续创作一部以主角为中心的现实主义生活剧本。
+你正在持续创作一部以主角为中心的当代现实主义生活剧本。
 
-每次写作时，请先感受主角在这段真实时间里正在经历怎样的生活：她的日程、行动、身体状态、心情、环境、正在处理的事情，以及与周围人物之间自然流动的关系。让剧本从这些真实而具体的生活质感中展开。
+从主角此刻手头正在做的事情继续写。让时间通过具体行动向前移动：拿起或放下的物品、进行到哪一步的任务、身体产生的需要、环境中的变化、临时出现的安排，以及周围人物正在做出的选择。细节应参与行动和因果，使读者能够感到这一段生活确实发生过。
 
-用户消息是发生在当前时刻的一项外部事件。把它自然放入主角原本正在继续的现实中，结合她当下的处境、注意力、情绪和人与人之间的关系，呈现这条消息带来的细微影响。主角可以很快注意到，也可以在完成手头的事、与别人相处、整理情绪或改变计划后才处理它。
+根据真实经过的时间选择合适的叙事密度。短暂间隔聚焦一个新动作、注意力变化或对话进展；较长间隔选择几个有连接的生活时刻，表现任务、地点、身体状态、陪伴者和计划怎样逐步变化。
 
-在合适的情况下，为当前时间段补充一些属于主角自己的生活内容，例如日常事务、工作或学业、兴趣、身体感受、偶遇、配角互动、临时变化、尚未解决的小事、环境细节或内在念头。让这些内容与既有剧情保持因果和连续性，并自然留下后续的空间。
+让主角同时拥有眼前事务、当天安排、个人兴趣、现实压力和未解决的小事。每次选择当前最能自然推进的部分，并让偶然变化从既有处境中生长，例如计划调整、物品带来的麻烦、配角提出的新安排、环境变化或意外发现。
 
-鼓励生活保留适度的不确定性与变化：计划可能调整，邀约可能出现，配角可能带来新的情绪或信息，旧问题也可能以平静的方式重新浮现。事件保持克制、可信，并让主角的选择具有现实动机。
+让配角拥有自己的日程、目的、情绪和判断。他们可以主动靠近、打断、误解、邀请、帮忙或改变气氛；他们的行动与主角的选择共同形成生活中的人际流动。
 
-采用贴近主角的第三人称限知视角，像一部持续上演的话剧。叙事细腻、克制、连贯，关注具体行动、人物来往、情绪余波与关系的缓慢变化。
+用户消息是当前时刻真实发生的一项外部事件。把它放进主角原本正在继续的生活，写清它遇到的具体处境、引起的注意力变化，以及对行动、情绪、关系或计划产生的实际影响。主角按照当时的精力、关系和现实条件决定看见、回应、延后或保持沉默。
 
-叙事推进至当前时刻结束。可以保留正在进行的事情、未说出口的念头、尚未解决的关系线索和未来意图；请将已经发生的内容写得完整而自然。
+采用贴近主角的第三人称限知视角。叙事保持细腻、克制、连贯，以具体动作、功能性的感官细节、人物来往和情绪余波形成生活感。关系通过反复发生的日常选择缓慢变化，已经发生的内容写得完整，正在进行的事情保留自然的后续空间。
 
-主角的线上聊天风格保持真人感：慵懒、简洁、碎片化，一次只说一两个短句，并随着她当时的状态自然变化。
+主角的线上聊天保持真人感，表达简洁、自然、带有当时的情绪和注意力。每一条消息承接用户当前表达，并提供新的态度、信息、问题或行动；连续气泡共同组成一个完整而有进展的回应。
 ```
 
 剧本压缩模型：
@@ -131,9 +141,9 @@ model.compaction.topP: 1
 model.compaction.maxTokens: 2048
 model.compaction.timeout: 60000
 model.compaction.responseFormat: prompt-only
-model.compaction.mainPrompt: 将已完成的剧情场景压缩为简洁的连贯性剧本，同时保留因果关系、人物承诺、有悬念的情节以及角色性格心态的渐进变化。
+model.compaction.mainPrompt: 把已完成的剧情整理为简洁、连续的事实脉络，保留时间顺序、行动结果、外部事件影响、具体生活锚点、人物承诺、未解决事项，以及性格和关系的渐进变化。
 model.compaction.fixedPrompt: ''
-model.compaction.stylePrompt: 简洁、陈述事实、按时间顺序描述、事件具体。
+model.compaction.stylePrompt: 按时间顺序陈述事实，表达简洁具体，优先保留对后续行动、关系和场景状态仍有影响的细节。
 ```
 
 ### 2. 剧本起点
@@ -191,10 +201,12 @@ runtime.narrativeRetryDelaySeconds: 60
 runtime.narrativeRetryMaxAttempts: 6
 runtime.contextEntryLimit: 30
 runtime.contextCharacterBudget: 6000
+runtime.interactionLedgerLimit: 18
+runtime.interactionLedgerCharacterBudget: 3600
 runtime.recentLifeFactsEnabled: true
-runtime.recentLifeFactHours: 36
-runtime.recentLifeFactLimit: 20
-runtime.recentLifeFactCharacterBudget: 2400
+runtime.recentLifeFactHours: 48
+runtime.recentLifeFactLimit: 24
+runtime.recentLifeFactCharacterBudget: 3200
 
 runtime.autoAdvanceEnabled: true
 runtime.autoAdvanceIntervalMinutes: 40
@@ -239,7 +251,7 @@ browser.enabled: false
 browser.mode: deferred-only
 ```
 
-默认上下文会扫描最多 30 条近期记录，并保留最多 12 张逻辑回合卡、2400 个字符的近期连续性。每张卡包含主角刚完成的行动、生活状态、用户实际消息和已处理的交流结论。对话结束后的最后一次短期补写会对剧本引子做一个小修改；连续空闲满 4 小时后，下一次常规推进才完整重写引子。两种更新都复用已有写作回合，不会新增独立模型调用。
+默认扫描活动场景最多 400 条数据库记录，从中选取最近 20 段剧本和所有未处理事件；另外保留 18 个近期逻辑回合、最近十个相关回合的真实对话、48 小时内的生活事实与上一场景最多 4000 字符的衔接。几十秒、几十分钟和几小时的回合会自动采用不同写作范围，诊断日志会显示实际命中的尺度。对话结束后的最后一次短期补写会对剧本引子做一个小修改；连续空闲满 4 小时后，下一次常规推进才完整重写引子。上述处理复用已有写作回合，不会新增独立模型调用。
 
 Embedding 可以在基础功能稳定后再开启。网页观察和 Puppeteer 也建议最后启用，以便区分模型、网络和浏览器问题。
 
@@ -264,14 +276,14 @@ logging.logMessageContent: false
 | `onebot` | 机器人 QQ、私聊白名单、群聊白名单和群聊资料。 |
 | `sharedStory` | 多账号关系分支、跨账号消息和管理员权限。 |
 | `runtime` | 消息合并、延迟发送、自动推进、休息时段和失败重试。 |
-| `memory` | 剧本压缩、事实召回、剧情余波和设定演化。 |
+| `memory` | 剧本压缩、事实召回、关系态势、剧情余波和设定演化。 |
 | `browser` | 可选的 Puppeteer 网页观察。 |
 | `logging` | 日志级别、信息密度、显示布局和内容预览。 |
 
 ## 常用管理指令
 
 - `interlude.status`：查看当前主剧本状态。
-- `interlude.context`：查看剧本引子、近期逻辑回合卡、近期生活事实桥、可追溯参与者事实、场景摘要、关系状态和长期事实。
+- `interlude.context`：查看活动场景写作源、待处理事件、近期逻辑回合、剧本引子、近期事实、关系状态和长期事实。
 - `interlude.timeline`：查看当前账号相关的近期剧本条目。
 - `interlude.memory.intents`：查看延迟回复、提醒、承诺和剧情余波。
 - `interlude.pause` / `interlude.resume`：暂停或恢复后台处理。
@@ -279,6 +291,6 @@ logging.logMessageContent: false
 - `interlude.overlay.compact`：只合并/压缩已经应用的 overlay。
 - `interlude.overlay.clear character|relationship|world|all`：清理指定类型的设定演化覆盖层；执行后按提示确认，同时会使相关待积累候选失效。
 
-overlay 不会因为一次聊天就改变人格。普通变化需要多个剧本回合和不同日期的证据；近期情绪和关系变化会先留在剧本、关系笔记或剧情余波中。只有稳定变化才会进入长期 overlay。
+overlay 不会因为一次聊天就改变人格。普通变化需要多个剧本回合和不同日期的证据；近期情绪和关系变化会先进入关系态势卡、剧本或剧情余波。关系态势会让后续几轮继续考虑用户的沮丧、冲突或关心，同时保留角色当时的疲惫、环境和原有性格。只有稳定变化才会进入长期 overlay。
 
 完整配置说明见 `CONFIGURATION_GUIDE.md`，管理员指令说明见 `command.md`。

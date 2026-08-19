@@ -102,6 +102,27 @@ const Vision: Schema<VisionConfig> = Schema.object({
   enabled: Schema.boolean().default(false).description('原生识图开关。开启后，当前私聊图片会作为多模态输入发送给所选 OpenAI-compatible 主模型；模型本身必须支持视觉输入。图片不会写入剧本数据库。'),
 }).collapse(true)
 
+const defaultMainPrompt = '持续创作一部以主角为中心的现实主义生活剧本。让日程、具体行动、身体节奏、兴趣、配角关系、现实压力、外部变化和未完事项共同推动时间，并让每个回合从既有生活中产生新的实际进展。'
+
+const defaultStylePrompt = `你正在持续创作一部以主角为中心的当代现实主义生活剧本。
+
+从主角此刻手头正在做的事情继续写。让时间通过具体行动向前移动：拿起或放下的物品、进行到哪一步的任务、身体产生的需要、环境中的变化、临时出现的安排，以及周围人物正在做出的选择。细节应参与行动和因果，使读者能够感到这一段生活确实发生过。
+
+根据真实经过的时间选择合适的叙事密度。短暂间隔聚焦一个新动作、注意力变化或对话进展；较长间隔选择几个有连接的生活时刻，表现任务、地点、身体状态、陪伴者和计划怎样逐步变化。
+
+让主角同时拥有眼前事务、当天安排、个人兴趣、现实压力和未解决的小事。每次选择当前最能自然推进的部分，并让偶然变化从既有处境中生长，例如计划调整、物品带来的麻烦、配角提出的新安排、环境变化或意外发现。
+
+让配角拥有自己的日程、目的、情绪和判断。他们可以主动靠近、打断、误解、邀请、帮忙或改变气氛；他们的行动与主角的选择共同形成生活中的人际流动。
+
+用户消息是当前时刻真实发生的一项外部事件。把它放进主角原本正在继续的生活，写清它遇到的具体处境、引起的注意力变化，以及对行动、情绪、关系或计划产生的实际影响。主角按照当时的精力、关系和现实条件决定看见、回应、延后或保持沉默。
+
+采用贴近主角的第三人称限知视角。叙事保持细腻、克制、连贯，以具体动作、功能性的感官细节、人物来往和情绪余波形成生活感。关系通过反复发生的日常选择缓慢变化，已经发生的内容写得完整，正在进行的事情保留自然的后续空间。
+
+主角的线上聊天保持真人感，表达简洁、自然、带有当时的情绪和注意力。每一条消息承接用户当前表达，并提供新的态度、信息、问题或行动；连续气泡共同组成一个完整而有进展的回应。`
+
+const defaultCompactionMainPrompt = '把已完成的剧情整理为简洁、连续的事实脉络，保留时间顺序、行动结果、外部事件影响、具体生活锚点、人物承诺、未解决事项，以及性格和关系的渐进变化。'
+const defaultCompactionStylePrompt = '按时间顺序陈述事实，表达简洁具体，优先保留对后续行动、关系和场景状态仍有影响的细节。'
+
 const Model: Schema<ModelConfig> = Schema.object({
   mode: Schema.union(['fallback', 'openai-compatible']).default('fallback').description('模型调用模式；fallback 仅用于未配置服务商时的本地回退。'),
   // 服务商字段较多，使用可折叠的纵向表单；横向 table 在 Console 窄屏上会溢出。
@@ -114,24 +135,10 @@ const Model: Schema<ModelConfig> = Schema.object({
   mainTimeout: Schema.natural().min(0).max(300_000).default(0).role('ms').description('主叙事模型超时时间；0 时使用模型预设或服务商默认值。'),
   mainResponseFormat: Schema.union(['json-object', 'prompt-only']).default('json-object').description('主叙事模型的响应格式。'),
   failover: Failover.default({ enabled: true, strategy: 'priority', maxAttemptsPerProvider: 1, cooldownMinutes: 5 }).description('主模型请求失败时的切换策略。'),
-  mainPrompt: Schema.string().role('textarea').default('以有丰富生活感和稍微突发奇想offset的行为、动机和人际关系为基础推动时光的流逝，延续以角色为中心的精彩生活剧本。').description('主叙事行为指令：定义模型如何连续写作、推进生活并处理外部事件。'),
+  mainPrompt: Schema.string().role('textarea').default(defaultMainPrompt).description('主叙事行为指令：定义模型如何连续写作、推进生活并处理外部事件。'),
   formatPrompt: Schema.string().role('textarea').default('').description('结构化输出补充说明；只能扩展固定协议，不能覆盖 JSON、时间和安全校验。'),
   fixedPrompt: Schema.string().role('textarea').default('').description('所有故事通用的长期约束。'),
-  stylePrompt: Schema.string().role('textarea').default(`你正在持续创作一部以主角为中心的现实主义生活剧本。
-
-每次写作时，请先感受主角在这段真实时间里正在经历怎样的生活：她的日程、行动、身体状态、心情、环境、正在处理的事情，以及与周围人物之间自然流动的关系。让剧本从这些真实而具体的生活质感中展开。
-
-用户消息是发生在当前时刻的一项外部事件。把它自然放入主角原本正在继续的现实中，结合她当下的处境、注意力、情绪和人与人之间的关系，呈现这条消息带来的细微影响。主角可以很快注意到，也可以在完成手头的事、与别人相处、整理情绪或改变计划后才处理它。
-
-在合适的情况下，为当前时间段补充一些属于主角自己的生活内容，例如日常事务、工作或学业、兴趣、身体感受、偶遇、配角互动、临时变化、尚未解决的小事、环境细节或内在念头。让这些内容与既有剧情保持因果和连续性，并自然留下后续的空间。
-
-鼓励生活保留适度的不确定性与变化：计划可能调整，邀约可能出现，配角可能带来新的情绪或信息，旧问题也可能以平静的方式重新浮现。事件保持克制、可信，并让主角的选择具有现实动机。
-
-采用贴近主角的第三人称限知视角，像一部持续上演的话剧。叙事细腻、克制、连贯，关注具体行动、人物来往、情绪余波与关系的缓慢变化。
-
-叙事推进至当前时刻结束。可以保留正在进行的事情、未说出口的念头、尚未解决的关系线索和未来意图；请将已经发生的内容写得完整而自然。
-
-主角的线上聊天风格保持真人感：慵懒、简洁、碎片化，一次只说一两个短句，并随着她当时的状态自然变化。`).description('全局叙事文风；故事级 style 可进一步覆盖。'),
+  stylePrompt: Schema.string().role('textarea').default(defaultStylePrompt).description('全局叙事文风；故事级 style 可进一步覆盖。'),
   embedding: Embedding.default({ enabled: false, modelId: '', providerId: '', endpoint: '', model: '', dimensions: 0, timeout: 10_000, maxInputCharacters: 4_000, backfillBatchSize: 5 }).description('长期事实的语义召回设置。'),
   groupGate: GroupGate.default({ enabled: false, modelId: '', providerId: '', model: '', temperature: 0.2, topP: 1, maxTokens: 500, timeout: 10_000, threshold: 0.65, prompt: '' }).description('群聊进入主叙事模型前的快速筛选模型。'),
   vision: Vision.default({ enabled: false }).description('OpenAI-compatible 原生图片输入。'),
@@ -145,10 +152,10 @@ const Model: Schema<ModelConfig> = Schema.object({
     timeout: Schema.natural().min(1_000).max(300_000).default(60_000).role('ms').description('压缩请求超时，单位毫秒。'),
     topP: Schema.number().min(0).max(1).default(1).description('压缩请求的核采样概率。'),
     responseFormat: Schema.union(['json-object', 'prompt-only']).default('json-object').description('压缩请求的 JSON 模式；不支持时改为 prompt-only。'),
-    mainPrompt: Schema.string().role('textarea').default('将已完成的剧情场景压缩为简洁的连贯性剧本，同时保留因果关系、人物承诺、有悬念的情节以及角色性格心态的渐进变化。').description('压缩任务指令：定义摘要、事实和状态变更的提取目标。'),
+    mainPrompt: Schema.string().role('textarea').default(defaultCompactionMainPrompt).description('压缩任务指令：定义摘要、事实和状态变更的提取目标。'),
     fixedPrompt: Schema.string().role('textarea').default('').description('压缩器必须遵守的长期规则。'),
-    stylePrompt: Schema.string().role('textarea').default('简洁、陈述事实、按时间顺序描述、事件具体。').description('压缩结果的表达风格。'),
-  }) as unknown as Schema<CompactionConfig>).default({ enabled: true, modelId: '', providerId: '', model: '', temperature: 0.3, topP: 1, maxTokens: 2048, timeout: 60_000, responseFormat: 'json-object', mainPrompt: '将已完成的剧情场景压缩为简洁的连贯性剧本，同时保留因果关系、人物承诺、有悬念的情节以及角色性格心态的渐进变化。', fixedPrompt: '', stylePrompt: '简洁、陈述事实、按时间顺序描述、事件具体。' }),
+    stylePrompt: Schema.string().role('textarea').default(defaultCompactionStylePrompt).description('压缩结果的表达风格。'),
+  }) as unknown as Schema<CompactionConfig>).default({ enabled: true, modelId: '', providerId: '', model: '', temperature: 0.3, topP: 1, maxTokens: 2048, timeout: 60_000, responseFormat: 'json-object', mainPrompt: defaultCompactionMainPrompt, fixedPrompt: '', stylePrompt: defaultCompactionStylePrompt }),
 })
 
 const RestWindowSchema: Schema<RestWindow> = Schema.object({
@@ -178,14 +185,18 @@ const Runtime: Schema<RuntimeConfig> = Schema.object({
   sweepIntervalMinutes: Schema.natural().min(1).max(1_440).default(5).description('后台扫描周期；仅用于发现到期任务，不代表每轮都调用模型。'),
   minimumAdvanceMinutes: Schema.natural().min(1).max(10_080).default(30).description('手动“interlude.advance”的最小有效补写间隔；到期计划和对话后的短期补写不受此限制。'),
   maxStoriesPerSweep: Schema.natural().min(1).max(1_000).default(20).description('单轮后台扫描最多处理的主剧本数量。'),
-  contextEntryLimit: Schema.natural().min(1).max(200).default(30).description('主模型扫描近期记录的数量上限。不会把原剧本正文作为实时上下文。'),
+  activeSceneEntryLimit: Schema.natural().min(20).max(1_000).default(400).description('活动场景的数据库扫描上限。它负责找到近期剧本和待处理事件，不代表这些条目会全部发给模型。'),
+  activeSceneNarrativeLimit: Schema.natural().min(8).max(60).default(20).description('主模型读取的最近剧本段落数。默认 20 条，用于保留短期场景的发展轨迹。'),
+  activeSceneCharacterBudget: Schema.natural().min(4_000).max(200_000).default(60_000).description('近期剧本原文与待处理事件的字符预算。'),
+  previousSceneTailCharacters: Schema.natural().min(500).max(20_000).default(4_000).description('场景刚转换时保留的上一场景结尾预算。只用于衔接，不替代近期回合轨迹。'),
+  contextEntryLimit: Schema.natural().min(1).max(200).default(30).description('当前事件、近期回合与场景外事实的数据库扫描基数。'),
   contextCharacterBudget: Schema.natural().min(1_000).max(50_000).default(6_000).description('短期交流事实与当前事件的合计字符预算。默认值通常足以保留当前对话。'),
-  interactionLedgerLimit: Schema.natural().min(2).max(24).default(12).description('近期逻辑回合卡数量。它保留刚发生的用户语义、已送达结论与当时生活状态。'),
-  interactionLedgerCharacterBudget: Schema.natural().min(200).max(4_000).default(2_400).description('近期逻辑回合卡字符预算。它不回传旧剧本文字或历史回复原句。建议 1800–2400。'),
+  interactionLedgerLimit: Schema.natural().min(2).max(40).default(18).description('近期逻辑回合数量。它记录动作进展、外部事件影响、用户表达含义和已经完成的回应，与剧本原文共同保持连续性。'),
+  interactionLedgerCharacterBudget: Schema.natural().min(200).max(8_000).default(3_600).description('近期逻辑回合的字符预算。它保留小细节、因果结果和已完成的交流状态；最近对话前沿会另行保留少量真实收发消息。'),
   recentLifeFactsEnabled: Schema.boolean().default(true).description('保留最近生活事实桥。它让主模型知道昨晚或当天较早发生的具体事情，不会回传旧剧本文字。'),
-  recentLifeFactHours: Schema.natural().min(6).max(168).default(36).description('近期生活事实保留的时间范围，默认 36 小时，足以覆盖昨晚到今天的连续生活。'),
-  recentLifeFactLimit: Schema.natural().min(4).max(60).default(20).description('单次主模型最多读取多少条较早的生活事实。数值更高会增强日内连续性，也会增加上下文。'),
-  recentLifeFactCharacterBudget: Schema.natural().min(600).max(6_000).default(2_400).description('近期生活事实的字符预算。默认 2400；优先保留动作、地点、人物、约定与未完事项。'),
+  recentLifeFactHours: Schema.natural().min(6).max(168).default(48).description('近期生活事实保留的时间范围，默认 48 小时，覆盖今天、昨晚及前一天的重要生活变化。'),
+  recentLifeFactLimit: Schema.natural().min(4).max(60).default(24).description('单次主模型最多读取多少条较早的生活事实。数值更高会增强跨日连续性，也会增加上下文。'),
+  recentLifeFactCharacterBudget: Schema.natural().min(600).max(8_000).default(3_200).description('近期生活事实的字符预算。优先保留具体动作、时间地点、外部事件影响、人物、约定与未完事项。'),
   memoryLimit: Schema.natural().min(1).max(200).default(20).description('主模型读取的长期事实数量；会经过相关性重排。'),
   maxScriptCharacters: Schema.natural().min(500).max(12_000).default(8_000).description('单次写作允许追加的剧本文本上限。'),
   maxMessageCharacters: Schema.natural().min(1).max(12_000).default(2_000).description('单条可见消息的最大字符数。'),
@@ -256,6 +267,9 @@ const Memory: Schema<MemoryConfig> = Schema.object({
   activeConsequencePromptLimit: Schema.natural().min(1).max(20).default(6).description('单次主模型写作最多携带几条仍在生效的剧情余波。数值越高，连续性更强，但会增加少量上下文。'),
   activeConsequenceMaxDays: Schema.natural().min(1).max(30).default(7).description('一条剧情余波最长保留多少天。到期后会自然淡出；它不用于永久修改角色设定。'),
   activeConsequenceDefaultStrength: Schema.number().min(0).max(1).step(0.05).default(0.55).description('剧情余波未写明强度时的默认影响程度。0 表示极轻微，1 表示会明显影响主角近期生活。'),
+  relationshipMomentEnabled: Schema.boolean().default(true).description('启用关系态势卡：保存角色对当前关系局面、用户表现和交流方式的短期理解。它不会修改 Canon 或长期 Overlay。'),
+  relationshipMomentDefaultHours: Schema.natural().min(1).max(168).default(24).description('主模型未给出明确持续时间时，关系态势默认保留多少小时。后续回合仍可提前更新或结束。'),
+  relationshipMomentMaxHours: Schema.natural().min(1).max(720).default(168).description('单张关系态势卡允许保留的最长时间。用于避免一次短期情绪永久支配关系。'),
   overlayCompressionEnabled: Schema.boolean().default(true).description('将较久以前、已应用的人设和关系变化压缩为分层摘要；不会改变 Canon 或删除原始补丁。'),
   overlayRecentDays: Schema.natural().min(1).max(14).default(2).description('最近多少天的 overlay 变化保留原始细节，不进入压缩。默认 2 天。'),
   overlayMonthlyAfterDays: Schema.natural().min(5).max(180).default(10).description('超过多少天后，将短期摘要合并为长期状态。默认 10 天。'),
@@ -450,13 +464,14 @@ function registerCommands(ctx: Context, service: InterludeService) {
       return memories.map(memory => `[${memory.category}/${memory.importance.toFixed(2)}] ${memory.content}`).join('\n')
     })
 
-  ctx.command('interlude.context', '查看剧本引子、近期逻辑回合卡、场景摘要、人物变化和长期事实')
+  ctx.command('interlude.context', '查看活动场景、剧本引子、场景摘要、人物变化和长期事实')
     .action(async ({ session }) => {
       const story = await requireStory(service, session)
       if (typeof story === 'string') return story
       const participant = await service.findParticipant(session, story)
-      const [scene, arc, facts, recentTurns, recentLifeFacts] = await Promise.all([
+      const [scene, arc, facts, activeSource, recentTurns, recentLifeFacts] = await Promise.all([
         service.activeScene(story.id), service.activeArc(story.id), service.facts(story.id, 8, '', participant?.id),
+        service.activeSceneSource(story.id, participant?.id),
         service.recentLogicalTurns(story.id, participant?.id),
         service.recentLifeFacts(story.id, participant?.id),
       ])
@@ -464,7 +479,8 @@ function registerCommands(ctx: Context, service: InterludeService) {
       const participantFacts = visibleTurns.flatMap(turn => turn.participantFacts ?? []).slice(-6)
       return [
         `剧本引子：${story.state.storyHook ? JSON.stringify(story.state.storyHook) : '等待首次常规空闲推进生成'}`,
-        `近期逻辑回合卡：${visibleTurns.length ? JSON.stringify(visibleTurns) : '尚未生成'}`,
+        `活动场景写作源：${activeSource ? `场景=${activeSource.sceneId} 近期剧本/待处理条目=${activeSource.entries.length} 上一场景尾部=${activeSource.previousSceneTail.length} 待处理事件=${activeSource.pendingEventIds.length}` : '尚未建立'}`,
+        `近期逻辑回合：${visibleTurns.length ? JSON.stringify(visibleTurns) : '尚未形成'}`,
         `近期生活事实桥：${recentLifeFacts.length ? JSON.stringify(recentLifeFacts) : '尚未生成或已关闭'}`,
         `可追溯参与者事实：${participantFacts.length ? JSON.stringify(participantFacts) : '近期没有需要延续的参与者事实'}`,
         `场景引子：${scene?.hook || '尚未整理'}`,

@@ -25,6 +25,13 @@ export interface StoryState {
     settingOverlay: StorySettingOverlay;
     activeSceneId?: number;
     activeArcId?: number;
+    /** Live state of the prose scene currently supplied verbatim to the writer. */
+    activeSceneState?: SceneStateSnapshot;
+    /** Real user events not yet seen by the protagonist; survives scene changes. */
+    pendingSceneEventIds?: string[];
+    /** Set by the main writer; background compaction closes the scene only
+     * after its full source material has been archived successfully. */
+    sceneTransitionPending?: SceneTransitionRequest;
     /**
      * 空闲期更新的事实型剧本引子。它描述故事现在从哪里继续，不保存正文
      * 句式，因此实时写作无需反复学习主模型以前写过的 prose。
@@ -43,6 +50,62 @@ export interface StoryState {
     lastStoryHookPatchAt?: string;
     /** 自动推进时钟；ISO 字符串便于跨进程/数据库 JSON 持久化。 */
     automation: StoryAutomationState;
+}
+export type SceneEventStatus = 'pending' | 'unseen' | 'noticed' | 'responded' | 'absorbed';
+export interface SceneEventResult {
+    /** Source id such as entry:123. Only real stored event ids are accepted. */
+    eventId: string;
+    status: SceneEventStatus;
+    /** Short factual effect of the event on the current scene. */
+    effect?: string;
+}
+export interface SceneStateSnapshot {
+    label: string;
+    location: string;
+    activity: string;
+    /** What the protagonist is physically doing at the end of the turn. */
+    currentAction?: string;
+    /** Recently completed actions stop the next turn from restarting them. */
+    completedActions?: string[];
+    /** Actions explicitly paused by an interruption, with the reason included. */
+    pausedActions?: string[];
+    bodyState?: string;
+    mood?: string;
+    attention?: string;
+    participants: string[];
+    openMatters: string[];
+    updatedAt?: string;
+}
+export interface SceneStateDecision extends SceneStateSnapshot {
+    action: 'continue' | 'close-and-open';
+    closeReason?: string;
+}
+export interface SceneTransitionRequest extends SceneStateDecision {
+    requestedAt: string;
+    sourceEntryId?: number;
+}
+export interface ActiveSceneEntry {
+    id: string;
+    type: 'script' | 'user-message' | 'character-message' | 'group-message' | 'character-group-message' | 'life-event';
+    actor: string;
+    participantId?: string;
+    occurredAt: Date;
+    content: string;
+    eventStatus?: SceneEventStatus;
+    eventEffect?: string;
+    /** Factual meaning already conveyed in this authored turn. */
+    exchange?: ConversationTrace;
+}
+export interface ActiveSceneContext {
+    sceneId: number;
+    startedAt: Date;
+    state?: SceneStateSnapshot;
+    /** Last portion of the immediately preceding closed scene. */
+    previousSceneTail: ActiveSceneEntry[];
+    /** Chronological source of truth for the current scene. */
+    entries: ActiveSceneEntry[];
+    /** Real user events that still need to be seen or absorbed. */
+    pendingEventIds: string[];
 }
 /**
  * Replace-in-place anchor written only during an ordinary idle advance.
@@ -87,8 +150,12 @@ export interface ParticipantTraceFact {
  */
 export interface SceneTrace {
     situation: string;
+    /** Life dimensions that materially moved in this turn. */
+    focus?: NarrativeFocus[];
     /** Completed protagonist actions, kept separate from descriptive prose. */
     actions?: string[];
+    /** Exact small facts worth carrying across several later turns. */
+    anchors?: string[];
     details: string[];
     unfinished: string[];
     /**
@@ -100,11 +167,18 @@ export interface SceneTrace {
     /** User-related continuity notes. Every item must cite an input evidence id. */
     participantFacts?: ParticipantTraceFact[];
 }
+export type NarrativeFocus = 'routine' | 'study-work' | 'interest' | 'social' | 'relationship' | 'body' | 'environment' | 'unexpected' | 'reflection';
 export interface ConversationTrace {
     /** What the participant meant, asked, asserted, or referred to. */
     userMeaning?: string;
     /** What the protagonist actually conveyed or decided in response. */
     responseMeaning?: string;
+    /** Speech acts that have already reached the participant in this turn. */
+    completedMoves?: string[];
+    /** Concrete conversational questions or requests that remain unresolved. */
+    openQuestions?: string[];
+    /** The distinct conversational step completed by this turn. */
+    newMove?: string;
     /** Whether the exchange is settled, intentionally open, or not applicable. */
     status?: 'answered' | 'acknowledged' | 'open' | 'none';
 }
@@ -119,7 +193,11 @@ export interface RecentLogicalTurn {
     phase: NarrativePhase;
     occurredAt: Date;
     situation: string;
+    focus: NarrativeFocus[];
     actions: string[];
+    anchors: string[];
+    /** Causal results tied to real inbound event ids. */
+    eventEffects: SceneEventResult[];
     details: string[];
     unfinished: string[];
     /** Exact external wording observed during this logical turn. */
@@ -144,7 +222,10 @@ export interface RecentLifeFact {
     occurredAt: Date;
     phase: NarrativePhase;
     situation: string;
+    focus: NarrativeFocus[];
     actions: string[];
+    anchors: string[];
+    eventEffects: SceneEventResult[];
     details: string[];
     unfinished: string[];
     exchange?: ConversationTrace;
@@ -161,6 +242,36 @@ export interface ParticipantKnownFact {
     fact: string;
     occurredAt?: Date;
 }
+/** A short-lived, participant-specific interpretation of the current
+ * relationship situation. It affects how the protagonist communicates now,
+ * while Canon and Overlay remain the durable baseline. */
+export interface RelationshipMoment {
+    userSignal?: {
+        summary: string;
+        basis: 'observed-expression' | 'character-inference' | 'shared-event';
+        confidence: number;
+        evidenceIds: string[];
+    };
+    characterPosition: string;
+    communicationPosture: string;
+    openNeed?: string;
+    alreadyExpressed: string[];
+    intensity: number;
+    updatedAt: string;
+    expiresAt: string;
+}
+/** Same-call update returned by the main writer. `keep` preserves the current
+ * card, `update` replaces/extends it, and `resolve` clears it. */
+export interface RelationshipMomentUpdate {
+    action: 'keep' | 'update' | 'resolve';
+    userSignal?: RelationshipMoment['userSignal'];
+    characterPosition?: string;
+    communicationPosture?: string;
+    openNeed?: string;
+    alreadyExpressed?: string[];
+    intensity?: number;
+    expiresAt?: string;
+}
 /**
  * One character can maintain several relationships in the same main story.
  * This state belongs to one real person / account, rather than to the whole
@@ -171,6 +282,7 @@ export interface ParticipantState {
     openThreads: string[];
     relationshipNotes: string[];
     relationshipOverlay?: string;
+    relationshipMoment?: RelationshipMoment;
     unreadMessageCount: number;
     pendingReplyCount: number;
     lastUserMessageAt?: string;
@@ -424,6 +536,15 @@ export interface ConversationActionDraft {
     willingness?: number;
     /** Short audit note explaining the concrete reason for this contact. */
     reason?: string;
+    /** Factual result conveyed to the recipient; never a quotation of the bubble. */
+    meaning?: string;
+}
+/** Delivery-grounded record of a recent proactive contact. */
+export interface RecentProactiveContact {
+    participantId: string;
+    occurredAt: Date;
+    meaning: string;
+    reason?: string;
 }
 export type InteractionReplyMode = 'none' | 'immediate' | 'delayed';
 export interface NarrativeInteraction {
@@ -439,6 +560,10 @@ export interface NarrativeDecision {
     script?: string;
     /** Factual delta for this turn; stored beside the script, never displayed. */
     sceneTrace?: SceneTrace;
+    /** Scene continuity result produced in the same main writing request. */
+    sceneState?: SceneStateDecision;
+    /** Processing state for real user-message events supplied by the plugin. */
+    eventResults?: SceneEventResult[];
     /** Present only when an ordinary idle turn explicitly requests a hook refresh. */
     storyHook?: StoryHook;
     /** Small delta requested at the settled end of a conversation cycle. */
@@ -447,6 +572,8 @@ export interface NarrativeDecision {
     continuity?: unknown;
     /** The machine-readable result placed after the prose. */
     interaction?: NarrativeInteraction;
+    /** Updates the current participant's short-lived relational situation. */
+    relationshipMomentUpdate?: RelationshipMomentUpdate;
     memories?: MemoryDraft[];
     intents?: IntentDraft[];
     /** Resolves existing active-consequence intents visible in this turn. */
@@ -471,7 +598,7 @@ export interface NarrativeImage {
     dataUri: string;
 }
 export interface NarrativeRequest {
-    /** 主模型读取事实型引子和增量卡，不读取最近剧本正文。 */
+    /** 主模型读取近期剧本、逻辑轨迹与分层历史。 */
     phase: NarrativePhase;
     /** Replace the factual story hook on this ordinary idle turn. */
     refreshStoryHook?: boolean;
@@ -480,6 +607,19 @@ export interface NarrativeRequest {
     story: InterludeStory;
     from: Date;
     now: Date;
+    /** Real-time writing granularity selected locally by the plugin. */
+    writingMode?: 'instant-exchange' | 'short-passage' | 'medium-passage' | 'long-passage';
+    /** Cancels an obsolete foreground request when a newer message supersedes it. */
+    abortSignal?: AbortSignal;
+    /** One-off correction after the previous delivered reply was copied. */
+    revision?: {
+        reason: string;
+        previousDeliveredMessages: string[];
+        previousResponseMeanings?: string[];
+        completedMoves?: string[];
+        previousScript?: string;
+        previousSceneAction?: string;
+    };
     userMessage?: string;
     /** Native image inputs observed in this one incoming user event only. */
     images?: NarrativeImage[];
@@ -494,10 +634,14 @@ export interface NarrativeRequest {
     activeConsequences: NarrativeIntent[];
     supersededIntents: NarrativeIntent[];
     storyHook?: StoryHook;
+    /** Verbatim active-scene source, excluding the separately supplied current event. */
+    activeScene?: ActiveSceneContext;
     /** Factual, delivery-grounded recent logical turns; no previous script prose. */
     recentLogicalTurns: RecentLogicalTurn[];
     /** Factual life bridge for the recent day, intentionally without chat wording. */
     recentLifeFacts: RecentLifeFact[];
+    /** Recent proactive contacts, used as semantic context rather than a cooldown. */
+    recentProactiveContacts: RecentProactiveContact[];
     /** Observed participant material, deliberately separate from authored prose. */
     participantKnownFacts: ParticipantKnownFact[];
     memories: NarrativeMemory[];
