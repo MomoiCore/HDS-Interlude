@@ -222,6 +222,20 @@ export interface RestWindow {
     minIntervalMinutes: number;
     maxIntervalMinutes: number;
 }
+/** One image attachment plus the adapter instance that received that exact
+ * message. A later text-only message can carry a different Session object,
+ * so using only the final session of a debounced batch loses OneBot file
+ * handles from earlier image messages. */
+export interface BufferedVisionSource {
+    source: string;
+    bot?: any;
+}
+/** Merge a debounced burst without detaching an attachment from the adapter
+ * that received it. Keeping this pure also makes the image-burst invariant
+ * directly testable without a live OneBot connection. */
+export declare function mergeBufferedVisionSources(messages: Array<{
+    imageSources: BufferedVisionSource[];
+}>): BufferedVisionSource[];
 export interface StoryDefaults {
     characterName: string;
     characterProfile: string;

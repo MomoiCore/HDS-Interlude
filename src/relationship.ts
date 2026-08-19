@@ -70,7 +70,12 @@ export function applyRelationshipMomentUpdate(current: RelationshipMoment | unde
     characterPosition,
     communicationPosture,
     ...(update.openNeed || current?.openNeed ? { openNeed: update.openNeed || current?.openNeed } : {}),
-    alreadyExpressed: update.alreadyExpressed ?? current?.alreadyExpressed ?? [],
+    // Empty output is not evidence that a previously delivered response has
+    // vanished. Preserve transport-grounded markers until the moment is
+    // resolved or replaced by a new concrete marker.
+    alreadyExpressed: update.alreadyExpressed?.length
+      ? update.alreadyExpressed
+      : current?.alreadyExpressed ?? [],
     intensity: update.intensity ?? current?.intensity ?? 0.55,
     updatedAt: now.toISOString(),
     expiresAt: update.expiresAt || current?.expiresAt || new Date(now.getTime() + 24 * 3_600_000).toISOString(),

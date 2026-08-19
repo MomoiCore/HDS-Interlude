@@ -270,12 +270,34 @@ interface AutoAdvanceConfig {
   restWindows: RestWindow[]
 }
 
+/** One image attachment plus the adapter instance that received that exact
+ * message. A later text-only message can carry a different Session object,
+ * so using only the final session of a debounced batch loses OneBot file
+ * handles from earlier image messages. */
+export interface BufferedVisionSource {
+  source: string
+  bot?: any
+}
+
+/** Merge a debounced burst without detaching an attachment from the adapter
+ * that received it. Keeping this pure also makes the image-burst invariant
+ * directly testable without a live OneBot connection. */
+export function mergeBufferedVisionSources(messages: Array<{ imageSources: BufferedVisionSource[] }>) {
+  const unique = new Map<string, BufferedVisionSource>()
+  for (const item of messages.flatMap(message => message.imageSources)) {
+    // Preserve the earliest source owner. It is the adapter session that
+    // definitely received the original OneBot file token.
+    if (!unique.has(item.source)) unique.set(item.source, item)
+  }
+  return Array.from(unique.values()).slice(0, 3)
+}
+
 interface BufferedUserMessage {
   content: string
   occurredAt: Date
   supersededIntents: NarrativeIntent[]
   /** Short-lived source links only; never written to HDSI storage. */
-  imageSources: string[]
+  imageSources: BufferedVisionSource[]
 }
 
 /** A per-relationship input buffer. Messages are durable immediately, while
@@ -1305,7 +1327,16 @@ export class InterludeService extends Service {
       turn.inFlightAbortController?.abort()
       this.reportOperation('standard', 'info', story, 'user-message', '连续消息使旧请求过期 参与者=%s 请求=%d', participant.id, turn.inFlightRequestId)
     }
-    turn.messages.push({ content, occurredAt: now, supersededIntents, imageSources })
+    // Preserve the adapter that owns each image source. In a burst such as
+    // "[image] / 这是什么 / 好可爱", the final Session is normally text-only;
+    // OneBot's get_image(file) still has to be called through the Session
+    // that received the original image segment.
+    turn.messages.push({
+      content,
+      occurredAt: now,
+      supersededIntents,
+      imageSources: imageSources.map(source => ({ source, bot: (session as any)?.bot })),
+    })
     turn.latestSession = session
     if (turn.timer) turn.timer()
     const revision = ++turn.nextRevision
@@ -1327,11 +1358,11 @@ export class InterludeService extends Service {
     return { content, sources }
   }
 
-  private async loadNativeImages(story: InterludeStory, sources: string[], session?: Session): Promise<NarrativeImage[]> {
+  private async loadNativeImages(sources: BufferedVisionSource[]): Promise<NarrativeImage[]> {
     if (!this.config.model.vision?.enabled || !sources.length) return []
-    const images = await Promise.all(sources.slice(0, 3).map(async (source, index) => {
+    const images = await Promise.all(sources.slice(0, 3).map(async ({ source, bot }, index) => {
       try {
-        const image = await this.fetchNativeImage(source, (session as any)?.bot)
+        const image = await this.fetchNativeImage(source, bot)
         return image ? { id: `turn-image-${index + 1}`, ...image } : undefined
       } catch (error) {
         this.reportStandalone('warn', '图片读取失败，已继续处理文字消息 错误=%s', error)
@@ -1508,8 +1539,16 @@ export class InterludeService extends Service {
       if (!snapshot) return
 
       const userMessage = formatBufferedUserMessages(batch)
-      const imageSources = Array.from(new Set(batch.flatMap(message => message.imageSources))).slice(0, 3)
-      const images = await this.loadNativeImages(snapshot.story, imageSources, turn.latestSession)
+      // Preserve the bot that received each image. Deduplication is by the
+      // transport source only, while retaining the first owning bot so an
+      // earlier OneBot file token is not resolved through a later text-only
+      // Session.
+      const imageSources = mergeBufferedVisionSources(batch)
+      const images = await this.loadNativeImages(imageSources)
+      if (imageSources.length) {
+        this.reportOperation('diagnostic', 'debug', snapshot.story, 'user-message',
+          '合并消息图片读取 附件=%d 成功=%d', imageSources.length, images.length)
+      }
       // If another message arrived while an image was being downloaded, put
       // this batch back and let the newer revision compose one combined event.
       if (turn.nextRevision !== revision) {
@@ -1928,6 +1967,7 @@ export class InterludeService extends Service {
         recentLifeFactCharacterBudget,
         story.setting.timezone,
         new Set([...recentLogicalTurns.map(turn => turn.entryId), ...activeSceneScriptIds]),
+        activeScene?.startedAt,
       )
       : []
     const bootstrapContext = !storyState.storyHook
@@ -2013,16 +2053,22 @@ export class InterludeService extends Service {
     const repeatedNarrative = repeatedNarrativeMatch(rawDecision, [
       ...(activeScene?.previousSceneTail ?? []), ...(activeScene?.entries ?? []),
     ])
-    if (repeated || repeatedNarrative) {
-      const correctionReason = [repeated?.reason, repeatedNarrative?.reason].filter(Boolean).join('+')
+    // A same-conversation-move can be a legitimate continuation when the
+    // current user event materially changes the stakes. The old code spent a
+    // second full model call correcting it, then deliberately kept it anyway.
+    // Keep expensive correction for literal/near-literal replays and prose
+    // stalls, while the contact-decision contract handles ordinary silence.
+    const replyNeedsCorrection = repeated?.reason !== 'same-conversation-move' ? repeated : undefined
+    if (replyNeedsCorrection || repeatedNarrative) {
+      const correctionReason = [replyNeedsCorrection?.reason, repeatedNarrative?.reason].filter(Boolean).join('+')
       this.reportOperation('standard', 'warn', story, phase,
         '检测到主模型写作停滞，执行一次上下文纠正重写 原因=%s 上一回合=%s',
-        correctionReason, repeated?.previous.entryId ?? repeatedNarrative?.previous.id ?? '?')
+        correctionReason, replyNeedsCorrection?.previous.entryId ?? repeatedNarrative?.previous.id ?? '?')
       rawDecision = await this.narrator.decide({
         ...request,
         revision: {
           reason: correctionReason,
-          previousDeliveredMessages: repeated?.previous.characterMessages ?? [],
+          previousDeliveredMessages: replyNeedsCorrection?.previous.characterMessages ?? [],
           previousResponseMeanings: recentLogicalTurns.slice(-12)
             .map(turn => turn.exchange?.newMove || turn.exchange?.responseMeaning || '').filter(Boolean),
           completedMoves: recentLogicalTurns.slice(-12)
@@ -2560,15 +2606,16 @@ export class InterludeService extends Service {
     const mapped = visible.map(entry => toActiveSceneEntry(entry, eventState))
       .filter((entry): entry is ActiveSceneEntry => !!entry)
       .filter(entry => !currentEventIds.has(entry.id))
-    // Keep roughly the same stable prose window that worked in the original
-    // implementation. Settled transport bubbles are represented once in the
-    // logical-turn/dialogue ledgers, so they cannot become a style template.
+    // Keep the stable raw window that worked in the original implementation.
+    // Settled transport belongs beside the prose that produced it, so the
+    // writer sees one chronological scene rather than a prose layer plus a
+    // second semantic dialogue layer.
     const entries = selectActiveScenePromptEntries(mapped, characterBudget, narrativeLimit)
 
     let previousSceneTail: ActiveSceneEntry[] = []
     // The previous tail is a temporary bridge, not a permanent second copy of
-    // history. Once the new scene has several authored passages, its own prose
-    // and the logical trajectory are sufficient and the extra query can stop.
+    // history. Once the new scene has several authored passages, its own
+    // chronological transcript is sufficient and the extra query can stop.
     const currentScriptCount = entries.filter(entry => entry.type === 'script').length
     const missingNarrativePassages = Math.max(0, narrativeLimit - currentScriptCount)
     if (missingNarrativePassages > 0) {
@@ -3138,7 +3185,7 @@ export class InterludeService extends Service {
           kind: 'character-message', actor: 'character', content: message.content,
           occurredAt: now.toISOString(), metadata: { visible: true, delivery: 'delivered', deliveredAt: now.toISOString(), ...(message.metadata ?? {}) },
         }, now, currentParticipant.id)
-        await this.recordCharacterMessage(currentParticipant, now, decisionAt)
+        await this.recordCharacterMessage(currentParticipant, now, decisionAt, message.content)
       })
     } catch (error) {
       // The adapter already accepted this message. A transient SQLite issue
@@ -3423,18 +3470,38 @@ export class InterludeService extends Service {
     return this.markParticipantSeen(participant, now)
   }
 
-  private async recordCharacterMessage(participant: InterludeParticipant, now: Date, decisionAt = now) {
+  private async recordCharacterMessage(participant: InterludeParticipant, now: Date, decisionAt = now, deliveredContent = '') {
     const current = normalizeParticipantState(participant.state)
     // The transport callback can be queued behind a brand-new incoming
     // message. Do not erase that newer unread/pending state merely because an
     // earlier outgoing message finished its database bookkeeping afterwards.
     const newerUserMessage = toDate(current.lastUserMessageAt)
     const preserveNewerUserState = !!newerUserMessage && newerUserMessage > decisionAt
+    const activeMoment = this.memoryConfig.relationshipMomentEnabled === false
+      ? undefined
+      : activeRelationshipMoment(current.relationshipMoment, now)
+    // `alreadyExpressed` is evidence about what the participant could really
+    // have read. Update it at the transport boundary rather than trusting a
+    // draft field from the narrator. The marker deliberately carries no
+    // quoted wording, so it cannot become another style example in context.
+    const deliveredMarker = deliveredContent.trim()
+      ? '已针对当前话题作出可见回应；后续交流应推进新的信息、问题或行动。'
+      : ''
+    const alreadyExpressed = activeMoment && deliveredMarker
+      ? Array.from(new Set([...activeMoment.alreadyExpressed, deliveredMarker])).slice(-8)
+      : activeMoment?.alreadyExpressed
     const state: ParticipantState = {
       ...current,
       unreadMessageCount: preserveNewerUserState ? current.unreadMessageCount : 0,
       pendingReplyCount: preserveNewerUserState ? current.pendingReplyCount : 0,
       lastCharacterMessageAt: now.toISOString(),
+      ...(activeMoment ? {
+        relationshipMoment: {
+          ...activeMoment,
+          alreadyExpressed: alreadyExpressed ?? [],
+          updatedAt: now.toISOString(),
+        },
+      } : {}),
     }
     await this.dbSet('interlude_participant', { id: participant.id }, { state, updatedAt: now })
     return { ...participant, state, updatedAt: now }
@@ -4803,12 +4870,19 @@ function collectRecentProactiveContacts(entries: ScriptEntry[], participantId: s
  * this boundary.
  */
 function collectRecentLifeFacts(
-  entries: ScriptEntry[], now: Date, hours: number, limit: number, characterBudget: number, timezone: string, excludeEntryIds: Set<number>,
+  entries: ScriptEntry[], now: Date, hours: number, limit: number, characterBudget: number, timezone: string, excludeEntryIds: Set<number>, activeSceneStartedAt?: Date,
 ) {
   const since = now.getTime() - hours * Time.hour
   const candidates: RecentLifeFact[] = []
   for (const entry of entries) {
-    if (entry.occurredAt.getTime() < since || excludeEntryIds.has(entry.id) || !isRecord(entry.metadata)) continue
+    // The active scene is represented by the chronological transcript. Do
+    // not also inject its older scene-trace summaries as "recent facts": it
+    // would make the narrator learn its own paraphrases instead of the actual
+    // sequence of events.
+    if (entry.occurredAt.getTime() < since
+      || (activeSceneStartedAt && entry.occurredAt >= activeSceneStartedAt)
+      || excludeEntryIds.has(entry.id)
+      || !isRecord(entry.metadata)) continue
     const trace = normalizeSceneTrace(entry.metadata.sceneTrace)
     if (!trace) continue
     const phase = isNarrativePhase(entry.metadata.phase) ? entry.metadata.phase : 'advance'
@@ -4975,7 +5049,19 @@ function deliveryGroundedConversationTrace(
   characterMessages: string[],
   status: RecentLogicalTurn['interactionState'],
 ) {
-  if (characterMessages.length) return trace ?? legacyConversationTrace(userMessages, characterMessages, status)
+  if (characterMessages.length) {
+    const settled = trace ?? legacyConversationTrace(userMessages, characterMessages, status)
+    if (!settled) return undefined
+    // A model may label a turn "open" simply because it wants to keep a
+    // conversation alive. The transport record is more trustworthy: once a
+    // visible answer was delivered, only an explicit unanswered question may
+    // keep this exchange open for the next writing turn.
+    const openQuestions = 'openQuestions' in settled ? settled.openQuestions : undefined
+    return {
+      ...settled,
+      status: openQuestions?.length ? 'open' as const : 'answered' as const,
+    }
+  }
   const userMeaning = trace?.userMeaning || (userMessages.length
     ? clip(userMessages.join(' / ').replace(/\s+/g, ' ').trim(), 220)
     : '')
@@ -5114,7 +5200,20 @@ function normalizeDecision(raw: NarrativeDecision, from: Date, now: Date, permit
       .slice(0, Math.max(0, shared.maxCrossConversationActions))
     : []
   const statePatch = isRecord(raw?.statePatch) ? pickParticipantStatePatch(raw.statePatch) : undefined
-  const sceneTrace = normalizeSceneTrace(raw?.sceneTrace)
+  let sceneTrace = normalizeSceneTrace(raw?.sceneTrace)
+  // Background writing has no newly observed participant message. Keeping a
+  // model-authored exchange from it makes an older chat look like a fresh
+  // event on the next request. Exchange is therefore phase-owned: a live
+  // user turn may carry it; conversation aftermath keeps it only when it
+  // really creates a new contact move.
+  if (sceneTrace && phase !== 'user-message') {
+    const keepAftermathExchange = phase === 'conversation-follow-up'
+      && followUpHasNewContactMove(phase, sceneTrace.exchange?.newMove)
+    if (!keepAftermathExchange) {
+      const { exchange: _exchange, ...withoutExchange } = sceneTrace
+      sceneTrace = withoutExchange
+    }
+  }
   if (interaction?.reply.mode !== 'none' && !followUpHasNewContactMove(phase, sceneTrace?.exchange?.newMove)) {
     interaction = { seen: true, reply: { mode: 'none' } }
   }
@@ -5524,16 +5623,17 @@ function normalizeInteraction(value: unknown, now: Date, runtime: RuntimeConfig)
   if (!isRecord(value) || typeof value.seen !== 'boolean' || !isRecord(value.reply)) return undefined
   const mode = value.reply.mode
   if (mode !== 'none' && mode !== 'immediate' && mode !== 'delayed') return undefined
+  const reason = typeof value.reason === 'string' ? clip(value.reason, 360) : undefined
   const content = typeof value.reply.content === 'string' ? value.reply.content.trim().slice(0, runtime.maxMessageCharacters) : undefined
   const sendAt = toDate(value.reply.sendAt)
 
-  if (!value.seen) return { seen: false, reply: { mode: 'none' } }
-  if (mode === 'none') return { seen: true, reply: { mode: 'none' } }
-  if (!content) return { seen: true, reply: { mode: 'none' } }
-  if (mode === 'immediate') return { seen: true, reply: { mode, content } }
+  if (!value.seen) return { seen: false, ...(reason ? { reason } : {}), reply: { mode: 'none' } }
+  if (mode === 'none') return { seen: true, ...(reason ? { reason } : {}), reply: { mode: 'none' } }
+  if (!content) return { seen: true, ...(reason ? { reason } : {}), reply: { mode: 'none' } }
+  if (mode === 'immediate') return { seen: true, ...(reason ? { reason } : {}), reply: { mode, content } }
   const delay = sendAt?.getTime() - now.getTime()
-  if (!sendAt || delay < runtime.minimumDelayedReplySeconds * 1_000 || delay > runtime.maximumDelayedReplyMinutes * Time.minute) return { seen: true, reply: { mode: 'none' } }
-  return { seen: true, reply: { mode, content, sendAt: sendAt.toISOString() } }
+  if (!sendAt || delay < runtime.minimumDelayedReplySeconds * 1_000 || delay > runtime.maximumDelayedReplyMinutes * Time.minute) return { seen: true, ...(reason ? { reason } : {}), reply: { mode: 'none' } }
+  return { seen: true, ...(reason ? { reason } : {}), reply: { mode, content, sendAt: sendAt.toISOString() } }
 }
 
 function validEntry(value: unknown, from: Date, now: Date): value is ScriptEntryDraft {

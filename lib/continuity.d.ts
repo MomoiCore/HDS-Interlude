@@ -13,9 +13,14 @@ export interface NarrativeFocusBalance {
  * underused life dimension belongs in the current scene. */
 export declare function narrativeFocusBalance(turns: RecentLogicalTurn[]): NarrativeFocusBalance | undefined;
 /**
- * Keep authored prose as the scene's literary continuity, while leaving
- * settled chat transport to the factual logical-turn ledger. Pending inbound
- * events remain pinned because they have not yet been incorporated.
+ * Build one chronological source of short-term truth for the writer.
+ *
+ * A previous refactor kept prose here but moved settled user/character
+ * messages into separate semantic cards. That made a single exchange appear
+ * several times in the prompt: once as prose, once as a model summary, and
+ * once as a dialogue ledger. In dense conversations the model then imitated
+ * its own summaries instead of continuing the actual sequence. Keep the
+ * recent script and the confirmed transport that belongs beside it together.
  */
 export declare function selectActiveScenePromptEntries(entries: ActiveSceneEntry[], characterBudget: number, narrativeLimit: number): ActiveSceneEntry[];
 export interface RepeatedReplyMatch {

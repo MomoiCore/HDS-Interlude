@@ -549,6 +549,10 @@ export interface RecentProactiveContact {
 export type InteractionReplyMode = 'none' | 'immediate' | 'delayed';
 export interface NarrativeInteraction {
     seen: boolean;
+    /** A compact, present-tense explanation of why the protagonist notices,
+     * leaves, or replies to this particular event. It is a same-turn writing
+     * aid, not a second model decision or a persistent personality trait. */
+    reason?: string;
     reply: {
         mode: InteractionReplyMode;
         content?: string;

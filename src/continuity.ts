@@ -56,9 +56,14 @@ export function narrativeFocusBalance(turns: RecentLogicalTurn[]): NarrativeFocu
 }
 
 /**
- * Keep authored prose as the scene's literary continuity, while leaving
- * settled chat transport to the factual logical-turn ledger. Pending inbound
- * events remain pinned because they have not yet been incorporated.
+ * Build one chronological source of short-term truth for the writer.
+ *
+ * A previous refactor kept prose here but moved settled user/character
+ * messages into separate semantic cards. That made a single exchange appear
+ * several times in the prompt: once as prose, once as a model summary, and
+ * once as a dialogue ledger. In dense conversations the model then imitated
+ * its own summaries instead of continuing the actual sequence. Keep the
+ * recent script and the confirmed transport that belongs beside it together.
  */
 export function selectActiveScenePromptEntries(
   entries: ActiveSceneEntry[],
@@ -66,37 +71,53 @@ export function selectActiveScenePromptEntries(
   narrativeLimit: number,
 ) {
   const ordered = [...entries].sort(compareSceneEntry)
-  const scripts = ordered.filter(entry => entry.type === 'script').slice(-Math.max(1, narrativeLimit))
+  const scripts = ordered.filter(entry => entry.type === 'script')
+  const selectedScripts = scripts.slice(-Math.max(1, narrativeLimit))
   const pendingEvents = ordered.filter(entry =>
     (entry.type === 'user-message' || entry.type === 'group-message')
     && (entry.eventStatus === 'pending' || entry.eventStatus === 'unseen'))
+  if (!selectedScripts.length) return uniqueSceneEntries(pendingEvents).sort(compareSceneEntry)
 
-  const pinned = uniqueSceneEntries(pendingEvents)
-  const selectedScripts: ActiveSceneEntry[] = []
-  let used = pinned.reduce((sum, entry) => sum + activeSceneEntrySize(entry), 0)
+  // Start just after the script that precedes the retained window. This
+  // includes the user event immediately before the first retained script,
+  // every delivered bubble produced by retained turns, and their original
+  // chronological order. A current event is removed later by service.ts, so
+  // it still has exactly one owner: currentEvent.
+  const firstScript = selectedScripts[0]
+  const firstScriptIndex = ordered.findIndex(entry => entry.id === firstScript.id)
+  let startIndex = 0
+  for (let index = firstScriptIndex - 1; index >= 0; index--) {
+    if (ordered[index].type === 'script') {
+      startIndex = index + 1
+      break
+    }
+  }
+  const transcript = ordered.slice(startIndex)
+  const selectedIds = new Set(selectedScripts.map(entry => entry.id))
+  const kept = transcript.filter(entry =>
+    selectedIds.has(entry.id)
+    || entry.type === 'user-message'
+    || entry.type === 'group-message'
+    || entry.type === 'character-message'
+    || entry.type === 'character-group-message')
+
+  // The normal budget is intentionally generous enough for complete turns.
+  // If an owner explicitly lowers it, retain the newest contiguous suffix
+  // instead of dropping messages from the middle of a turn.
+  const selected: ActiveSceneEntry[] = []
+  let used = 0
   const budget = Math.max(1_000, characterBudget)
-
-  for (let index = scripts.length - 1; index >= 0; index--) {
-    const entry = scripts[index]
-    // Keep the newest literary version when two adjacent model passages are
-    // essentially the same. Their factual turn cards remain available, so no
-    // event or action result is lost while the prompt stops amplifying a copy.
-    if (selectedScripts.some(selected => nearDuplicateProse(entry.content, selected.content))) continue
+  for (let index = kept.length - 1; index >= 0; index--) {
+    const entry = kept[index]
     const size = activeSceneEntrySize(entry)
-    if (selectedScripts.length && used + size > budget) continue
-    selectedScripts.unshift(entry)
+    if (selected.length && used + size > budget) break
+    selected.unshift(entry)
     used += size
   }
-
-  return uniqueSceneEntries([...selectedScripts, ...pinned])
+  // A pending source event is never optional, even when a small manual
+  // budget has already filled the transcript.
+  return uniqueSceneEntries([...selected, ...pendingEvents])
     .sort(compareSceneEntry)
-}
-
-function nearDuplicateProse(left: string, right: string) {
-  const normalize = (value: string) => value.replace(/[\s\p{P}\p{S}]+/gu, '').toLocaleLowerCase()
-  const a = normalize(left)
-  const b = normalize(right)
-  return Math.min(a.length, b.length) >= 120 && diceCoefficient(a, b) >= 0.93
 }
 
 function uniqueSceneEntries(entries: ActiveSceneEntry[]) {
